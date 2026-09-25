@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+"""gj - track lines of effort across Claude, Codex, and Grok agent sessions.
+
+One SQLite file, one CLI, one local dashboard. Stdlib only (Python 3.9+).
+
+Agents call `gj start` when they begin work that will produce a PR, and
+`gj pr <url>` once the PR exists. `gj sync` pulls PR state from GitHub (and
+finds PRs by branch when an agent forgot to link one). `gj serve` shows the
+dashboard, with a copyable command to jump back into each session.
+"""
+import argparse
+import concurrent.futures
+import html
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path.home()
+DB_PATH = Path(os.environ.get("GJ_DB", HOME / ".local/share/gj/gj.db"))
+STALE_DAYS = float(os.environ.get("GJ_STALE_DAYS", "3"))
+AGENTS = ("claude", "codex", "grok")
+STATUSES = ("active", "review", "blocked", "done", "dropped")
+OPEN_STATUSES = ("active", "review", "blocked")
+PR_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS efforts (
+    id          INTEGER PRIMARY KEY,
+    title       TEXT NOT NULL,
+    prompt      TEXT NOT NULL DEFAULT '',
+    epic        TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'active',
+    note        TEXT NOT NULL DEFAULT '',
+    agent       TEXT NOT NULL DEFAULT '',
+    session_id  TEXT NOT NULL DEFAULT '',
+    cwd         TEXT NOT NULL DEFAULT '',
+    repo        TEXT NOT NULL DEFAULT '',
+    branch      TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prs (
+    url            TEXT PRIMARY KEY,
+    effort_id      INTEGER NOT NULL REFERENCES efforts(id) ON DELETE CASCADE,
+    repo           TEXT NOT NULL,
+    number         INTEGER NOT NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    state          TEXT NOT NULL DEFAULT '',   -- OPEN / MERGED / CLOSED
+    draft          INTEGER NOT NULL DEFAULT 0,
+    review         TEXT NOT NULL DEFAULT '',   -- APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+    checks         TEXT NOT NULL DEFAULT '',   -- pass / fail / pending / ''
+    mergeable      TEXT NOT NULL DEFAULT '',   -- MERGEABLE / CONFLICTING / UNKNOWN
+    pr_updated_at  REAL NOT NULL DEFAULT 0,
+    synced_at      REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS efforts_session ON efforts(agent, session_id);
+"""
+
+
+# ---------------------------------------------------------------- storage
+
+def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def now():
+    return time.time()
+
+
+def parse_ts(s):
+    if not s:
+        return 0.0
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def ago(ts):
+    if not ts:
+        return "-"
+    s = max(0, now() - ts)
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return "%d%s" % (s // n, unit)
+    return "now"
+
+
+# ------------------------------------------------------ session detection
+
+def run(cmd, cwd=None, timeout=30):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout.strip() if p.returncode == 0 else None
+
+
+def ancestors():
+    """(pid, command) for each ancestor process, nearest first."""
+    out = run(["ps", "-A", "-o", "pid=,ppid=,comm="]) or ""
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    chain, pid = [], os.getppid()
+    while pid in procs and pid > 1 and len(chain) < 50:
+        ppid, comm = procs[pid]
+        chain.append((pid, os.path.basename(comm)))
+        pid = ppid
+    return chain
+
+
+def detect_agent():
+    """Which agent is running us, and its pid. Env vars win over the process tree."""
+    if os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDECODE"):
+        return "claude", int(os.environ.get("CLAUDE_PID") or 0)
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID"):
+        return "codex", 0
+    for pid, comm in ancestors():
+        for a in AGENTS:
+            if comm == a or comm.startswith(a + "-") or comm.startswith(a + "."):
+                return a, pid
+    return "", 0
+
+
+def claude_session(cwd, pid):
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if sid:
+        return sid
+    proj = HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0].stem if files else ""
+
+
+def codex_session(cwd, pid):
+    sid = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID") or ""
+    if sid:
+        return sid
+    path = HOME / ".codex/state_5.sqlite"
+    if not path.exists():
+        cands = sorted((HOME / ".codex").glob("state_*.sqlite"))
+        if not cands:
+            return ""
+        path = cands[-1]
+    try:
+        c = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+        row = c.execute(
+            "SELECT id FROM threads WHERE cwd = ? AND thread_source = 'user' "
+            "ORDER BY updated_at DESC LIMIT 1", (cwd,)).fetchone()
+        c.close()
+        return row[0] if row else ""
+    except sqlite3.Error:
+        return ""
+
+
+def grok_session(cwd, pid):
+    sid = os.environ.get("GROK_SESSION_ID", "")
+    if sid:
+        return sid
+    try:
+        active = json.loads((HOME / ".grok/active_sessions.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    for s in active:
+        if pid and s.get("pid") == pid:
+            return s["session_id"]
+    same_dir = [s for s in active if s.get("cwd") == cwd]
+    same_dir.sort(key=lambda s: s.get("opened_at", ""), reverse=True)
+    return same_dir[0]["session_id"] if same_dir else ""
+
+
+def detect_session(agent, cwd, pid):
+    fn = {"claude": claude_session, "codex": codex_session, "grok": grok_session}.get(agent)
+    return fn(cwd, pid) if fn else ""
+
+
+def first_user_prompt(agent, session_id, cwd):
+    """Best-effort: pull the session's first user message from the agent's own logs."""
+    try:
+        if agent == "claude":
+            proj = HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+            for line in open(proj / (session_id + ".jsonl")):
+                d = json.loads(line)
+                if d.get("type") == "user" and not d.get("isMeta"):
+                    c = d.get("message", {}).get("content")
+                    if isinstance(c, list):
+                        c = " ".join(x.get("text", "") for x in c if x.get("type") == "text")
+                    if c and not c.startswith("<local-command") and not c.startswith("Caveat:"):
+                        m = re.search(r"<command-args>(.*?)</command-args>", c, re.S)
+                        return (m.group(1) if m else c).strip()
+        elif agent == "codex":
+            c = sqlite3.connect("file:%s?mode=ro" % (HOME / ".codex/state_5.sqlite"), uri=True)
+            row = c.execute("SELECT first_user_message FROM threads WHERE id = ?",
+                            (session_id,)).fetchone()
+            c.close()
+            return (row[0] or "").strip() if row else ""
+        elif agent == "grok":
+            d = HOME / ".grok/sessions" / urllib.parse.quote(cwd, safe="") / session_id
+            for line in open(d / "chat_history.jsonl"):
+                m = json.loads(line)
+                if m.get("type") == "user":
+                    # Early user messages are injected context; the request is in <user_query>.
+                    text = " ".join(x.get("text", "") for x in m.get("content", [])
+                                    if isinstance(x, dict))
+                    q = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
+                    if q:
+                        return q.group(1).strip()
+    except (OSError, ValueError, sqlite3.Error):
+        pass
+    return ""
+
+
+def git_info(cwd):
+    branch = run(["git", "branch", "--show-current"], cwd=cwd) or ""
+    remote = run(["git", "remote", "get-url", "origin"], cwd=cwd) or ""
+    m = re.search(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?$", remote)
+    return (m.group(1) if m else ""), branch
+
+
+def resume_cmd(e):
+    cd = "cd %s && " % shlex.quote(e["cwd"]) if e["cwd"] else ""
+    sid = shlex.quote(e["session_id"]) if e["session_id"] else ""
+    if e["agent"] == "claude":
+        return cd + ("claude --resume %s" % sid if sid else "claude --continue")
+    if e["agent"] == "codex":
+        return cd + ("codex resume %s" % sid if sid else "codex resume --last")
+    if e["agent"] == "grok":
+        return cd + ("grok --resume %s" % sid if sid else "grok --continue")
+    return cd.rstrip("& ") if cd else ""
+
+
+# ---------------------------------------------------------------- effort ops
+
+def current_effort(conn, args):
+    """Resolve --id, else the effort registered by the calling agent session."""
+    if getattr(args, "id", None):
+        row = conn.execute("SELECT * FROM efforts WHERE id = ?", (args.id,)).fetchone()
+        if not row:
+            sys.exit("gj: no effort #%s" % args.id)
+        return row
+    agent, pid = detect_agent()
+    sid = detect_session(agent, os.getcwd(), pid) if agent else ""
+    if sid:
+        row = conn.execute(
+            "SELECT * FROM efforts WHERE agent = ? AND session_id = ? "
+            "ORDER BY updated_at DESC LIMIT 1", (agent, sid)).fetchone()
+        if row:
+            return row
+    sys.exit("gj: can't tell which effort this is (no matching session); pass --id N")
+
+
+def touch(conn, eid, **fields):
+    fields["updated_at"] = now()
+    sets = ", ".join("%s = ?" % k for k in fields)
+    conn.execute("UPDATE efforts SET %s WHERE id = ?" % sets, (*fields.values(), eid))
+
+
+def add_pr(conn, eid, url):
+    m = PR_RE.search(url)
+    if not m:
+        sys.exit("gj: not a GitHub PR url: %s" % url)
+    url = "https://github.com/%s/pull/%s" % (m.group(1), m.group(2))
+    conn.execute(
+        "INSERT INTO prs(url, effort_id, repo, number) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET effort_id = excluded.effort_id",
+        (url, eid, m.group(1), int(m.group(2))))
+    return url
+
+
+def cmd_start(args):
+    conn = db()
+    cwd = os.path.realpath(args.cwd or os.getcwd())
+    agent, pid = detect_agent()
+    agent = args.agent or agent
+    sid = args.session or (detect_session(agent, cwd, pid) if agent else "")
+    repo, branch = git_info(cwd)
+    prompt = args.prompt or (first_user_prompt(agent, sid, cwd) if sid else "")
+    existing = None
+    if agent and sid:
+        existing = conn.execute(
+            "SELECT id FROM efforts WHERE agent = ? AND session_id = ? AND status IN (%s) "
+            "ORDER BY id DESC LIMIT 1" % ",".join("?" * len(OPEN_STATUSES)),
+            (agent, sid, *OPEN_STATUSES)).fetchone()
+    if existing and not args.new:
+        eid = existing["id"]
+        fields = dict(title=args.title, cwd=cwd, repo=repo, branch=branch)
+        if args.prompt:
+            fields["prompt"] = args.prompt
+        if args.epic:
+            fields["epic"] = args.epic
+        touch(conn, eid, **fields)
+        verb = "updated"
+    else:
+        t = now()
+        eid = conn.execute(
+            "INSERT INTO efforts(title, prompt, epic, agent, session_id, cwd, repo, branch, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, t, t)).lastrowid
+        verb = "started"
+    for url in args.pr or []:
+        add_pr(conn, eid, url)
+    conn.commit()
+    print("gj: %s effort #%d [%s %s] %s" % (verb, eid, agent or "?", sid[:8] or "-", args.title))
+
+
+def cmd_pr(args):
+    conn = db()
+    e = current_effort(conn, args)
+    urls = [add_pr(conn, e["id"], u) for u in args.urls]
+    repo, branch = git_info(e["cwd"]) if e["cwd"] and os.path.isdir(e["cwd"]) else ("", "")
+    fields = {"status": "review"} if e["status"] == "active" else {}
+    if branch:
+        fields.update(branch=branch, repo=repo or e["repo"])
+    touch(conn, e["id"], **fields)
+    conn.commit()
+    sync_prs(conn, urls)
+    print("gj: #%d linked %s" % (e["id"], " ".join(urls)))
+
+
+def cmd_status(args):
+    conn = db()
+    e = current_effort(conn, args)
+    fields = {"status": args.status}
+    if args.note is not None:
+        fields["note"] = args.note
+    touch(conn, e["id"], **fields)
+    conn.commit()
+    print("gj: #%d -> %s" % (e["id"], args.status))
+
+
+def cmd_note(args):
+    conn = db()
+    e = current_effort(conn, args)
+    touch(conn, e["id"], note=" ".join(args.text))
+    conn.commit()
+    print("gj: #%d noted" % e["id"])
+
+
+def cmd_edit(args):
+    conn = db()
+    e = current_effort(conn, args)
+    fields = {k: v for k, v in (("title", args.title), ("epic", args.epic),
+                                ("prompt", args.prompt)) if v is not None}
+    touch(conn, e["id"], **fields)
+    conn.commit()
+    print("gj: #%d edited" % e["id"])
+
+
+def cmd_rm(args):
+    conn = db()
+    conn.execute("DELETE FROM efforts WHERE id = ?", (args.id,))
+    conn.commit()
+    print("gj: #%d deleted" % args.id)
+
+
+# ---------------------------------------------------------------- github sync
+
+GH_FIELDS = "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,updatedAt"
+
+
+def rollup(checks):
+    states = set()
+    for c in checks or []:
+        s = (c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
+        if s in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            states.add("fail")
+        elif s in ("SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"):
+            states.add("pass")
+        else:
+            states.add("pending")
+    for s in ("fail", "pending", "pass"):
+        if s in states:
+            return s
+    return ""
+
+
+def fetch_pr(url):
+    out = run(["gh", "pr", "view", url, "--json", GH_FIELDS])
+    return url, (json.loads(out) if out else None)
+
+
+def sync_prs(conn, urls):
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(fetch_pr, urls))
+    ok = 0
+    for url, d in results:
+        if not d:
+            continue
+        ok += 1
+        conn.execute(
+            "UPDATE prs SET title=?, state=?, draft=?, review=?, checks=?, mergeable=?, "
+            "pr_updated_at=?, synced_at=? WHERE url=?",
+            (d["title"], d["state"], int(d["isDraft"]), d.get("reviewDecision") or "",
+             rollup(d.get("statusCheckRollup")), d.get("mergeable") or "",
+             parse_ts(d.get("updatedAt")), now(), url))
+    conn.commit()
+    return ok, len(urls)
+
+
+def discover_prs(conn):
+    """Link PRs the agent forgot to record, by looking up each open effort's branch."""
+    found = []
+    rows = conn.execute(
+        "SELECT * FROM efforts WHERE status IN (%s) AND NOT EXISTS "
+        "(SELECT 1 FROM prs WHERE prs.effort_id = efforts.id)"
+        % ",".join("?" * len(OPEN_STATUSES)), OPEN_STATUSES).fetchall()
+    for e in rows:
+        branch, repo = e["branch"], e["repo"]
+        if e["cwd"] and os.path.isdir(e["cwd"]):
+            repo, branch = git_info(e["cwd"])
+            repo = repo or e["repo"]
+        if not repo or not branch or branch in ("main", "master", "develop", "trunk"):
+            continue
+        out = run(["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "all",
+                   "--json", "url,createdAt"])
+        for pr in json.loads(out or "[]"):
+            if parse_ts(pr["createdAt"]) >= e["created_at"] - 3600:
+                found.append(add_pr(conn, e["id"], pr["url"]))
+        if branch != e["branch"]:
+            conn.execute("UPDATE efforts SET branch = ? WHERE id = ?", (branch, e["id"]))
+    conn.commit()
+    return found
+
+
+def auto_close(conn):
+    """Efforts whose PRs are all merged/closed are done."""
+    rows = conn.execute(
+        "SELECT e.id, SUM(p.state = 'MERGED') merged, SUM(p.state IN ('MERGED','CLOSED')) shut, "
+        "COUNT(*) n FROM efforts e JOIN prs p ON p.effort_id = e.id "
+        "WHERE e.status IN ('active','review') GROUP BY e.id").fetchall()
+    closed = []
+    for r in rows:
+        if r["n"] and r["shut"] == r["n"]:
+            status = "done" if r["merged"] else "dropped"
+            touch(conn, r["id"], status=status)
+            closed.append((r["id"], status))
+    conn.commit()
+    return closed
+
+
+def sync_all(conn, all_prs=False):
+    found = discover_prs(conn)
+    q = "SELECT url FROM prs" if all_prs else (
+        "SELECT p.url FROM prs p JOIN efforts e ON e.id = p.effort_id "
+        "WHERE e.status IN ('active','review','blocked') OR p.state IN ('', 'OPEN')")
+    urls = [r["url"] for r in conn.execute(q)]
+    ok, total = sync_prs(conn, urls)
+    closed = auto_close(conn)
+    return {"discovered": found, "synced": ok, "total": total, "closed": closed}
+
+
+def cmd_sync(args):
+    conn = db()
+    r = sync_all(conn, args.all)
+    print("gj: synced %d/%d PRs" % (r["synced"], r["total"]))
+    for u in r["discovered"]:
+        print("gj: discovered %s" % u)
+    for eid, st in r["closed"]:
+        print("gj: #%d -> %s (all PRs closed)" % (eid, st))
+
+
+# ---------------------------------------------------------------- views
+
+def load(conn, include_closed=False):
+    q = "SELECT * FROM efforts"
+    if not include_closed:
+        q += " WHERE status IN ('active','review','blocked')"
+    efforts = [dict(r) for r in conn.execute(q)]
+    prs = {}
+    for p in conn.execute("SELECT * FROM prs ORDER BY number"):
+        prs.setdefault(p["effort_id"], []).append(dict(p))
+    for e in efforts:
+        e["prs"] = prs.get(e["id"], [])
+        e["resume"] = resume_cmd(e)
+        e["flags"] = flags(e)
+        last = max([e["updated_at"]] + [p["pr_updated_at"] for p in e["prs"]])
+        e["last_activity"] = last
+    efforts.sort(key=lambda e: (e["status"] in ("done", "dropped"), -len(e["flags"]),
+                                e["last_activity"]))
+    return efforts
+
+
+def flags(e):
+    """Why this effort needs your attention. Empty list = nothing to do right now."""
+    out = []
+    if e["status"] in ("done", "dropped"):
+        return out
+    open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
+    for p in open_prs:
+        tag = "#%d " % p["number"]
+        if p["checks"] == "fail":
+            out.append(tag + "checks failing")
+        if p["mergeable"] == "CONFLICTING":
+            out.append(tag + "merge conflict")
+        if p["review"] == "CHANGES_REQUESTED":
+            out.append(tag + "changes requested")
+        if p["review"] == "APPROVED" and p["checks"] != "fail" and not p["draft"]:
+            out.append(tag + "approved - merge it")
+        if p["pr_updated_at"] and now() - p["pr_updated_at"] > STALE_DAYS * 86400:
+            out.append(tag + "stale %s" % ago(p["pr_updated_at"]))
+    if e["status"] == "blocked":
+        out.append("blocked")
+    if not e["prs"] and now() - e["updated_at"] > STALE_DAYS * 86400:
+        out.append("no PR, idle %s" % ago(e["updated_at"]))
+    return out
+
+
+def cmd_ls(args):
+    conn = db()
+    if args.sync:
+        sync_all(conn)
+    efforts = load(conn, args.all)
+    if args.json:
+        print(json.dumps(efforts, indent=2, default=str))
+        return
+    if not efforts:
+        print("gj: nothing tracked. Agents register work with `gj start`.")
+        return
+    for e in efforts:
+        prs = " ".join("#%d:%s" % (p["number"], (p["state"] or "?").lower()) for p in e["prs"])
+        print("#%-4d %-7s %-6s %-5s %s%s" % (
+            e["id"], e["status"], e["agent"] or "?", ago(e["last_activity"]),
+            ("[%s] " % e["epic"]) if e["epic"] else "", e["title"]))
+        if prs:
+            print("      prs: %s" % prs)
+        if e["flags"]:
+            print("      !!  %s" % "; ".join(e["flags"]))
+        if e["resume"]:
+            print("      $ %s" % e["resume"])
+
+
+def cmd_resume(args):
+    conn = db()
+    e = conn.execute("SELECT * FROM efforts WHERE id = ?", (args.id,)).fetchone()
+    if not e:
+        sys.exit("gj: no effort #%s" % args.id)
+    print(resume_cmd(e))
+
+
+# ---------------------------------------------------------------- dashboard
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Efforts</title>
+<style>
+:root { --bg:#f7f7f5; --card:#fff; --fg:#1d1d1b; --mut:#6b6b66; --line:#e3e3de;
+        --warn:#b4540a; --warnbg:#fdf1e4; --bad:#b3261e; --badbg:#fbe9e7; --ok:#1e7a3a;
+        --okbg:#e6f4ea; --acc:#2f5bd3; --code:#f0f0ec; }
+@media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --fg:#ececea;
+        --mut:#9a9a94; --line:#33332f; --warn:#f0a35c; --warnbg:#3a2a18; --bad:#f28b82;
+        --badbg:#3c1f1d; --ok:#81c995; --okbg:#1c3324; --acc:#8ab4f8; --code:#2a2a27; } }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+header { display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:16px 24px;
+         border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:1 }
+h1 { font-size:18px; margin:0 12px 0 0 }
+.stats span { margin-right:14px; color:var(--mut) } .stats b { color:var(--fg) }
+.grow { flex:1 }
+button, select, input { font:inherit; color:inherit; background:var(--card);
+         border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer }
+input { cursor:text }
+button:hover { border-color:var(--acc) }
+main { padding:16px 24px; max-width:1200px; margin:0 auto }
+.epic { margin:22px 0 8px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--mut) }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px;
+        margin-bottom:10px }
+.card.hot { border-left:4px solid var(--warn) }
+.card.closed { opacity:.6 }
+.top { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap }
+.id { color:var(--mut); font-variant-numeric:tabular-nums }
+.title { font-weight:600; font-size:15px }
+.pill { font-size:12px; padding:1px 8px; border-radius:99px; background:var(--code); color:var(--mut) }
+.pill.claude{color:#c96442} .pill.codex{color:#10a37f} .pill.grok{color:var(--fg)}
+.meta { color:var(--mut); font-size:12px }
+.flags { margin:8px 0 0; display:flex; gap:6px; flex-wrap:wrap }
+.flag { font-size:12px; padding:2px 8px; border-radius:6px; background:var(--warnbg); color:var(--warn) }
+.prs { margin-top:8px; display:flex; flex-direction:column; gap:3px }
+.pr { font-size:13px } .pr a { color:var(--acc); text-decoration:none } .pr a:hover { text-decoration:underline }
+.st { font-size:11px; font-weight:600; padding:0 6px; border-radius:4px; margin-left:4px }
+.st.OPEN{background:var(--okbg);color:var(--ok)} .st.MERGED{background:#ece4fb;color:#6e40c9}
+.st.CLOSED{background:var(--badbg);color:var(--bad)} .st.fail{background:var(--badbg);color:var(--bad)}
+.st.pass{background:var(--okbg);color:var(--ok)} .st.pending{background:var(--code);color:var(--mut)}
+.st.warn{background:var(--warnbg);color:var(--warn)}
+.cmd { margin-top:10px; display:flex; gap:6px; align-items:stretch }
+.cmd code { flex:1; background:var(--code); border-radius:6px; padding:5px 9px; overflow-x:auto;
+            white-space:nowrap; font:12px ui-monospace,SFMono-Regular,Menlo,monospace }
+details { margin-top:8px } summary { cursor:pointer; color:var(--mut); font-size:12px }
+pre { white-space:pre-wrap; background:var(--code); padding:8px 10px; border-radius:6px;
+      font:12px ui-monospace,SFMono-Regular,Menlo,monospace; max-height:300px; overflow:auto }
+.note { margin-top:6px; font-size:13px }
+.actions { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap }
+.actions button { font-size:12px; padding:2px 8px }
+.empty { color:var(--mut); padding:40px 0; text-align:center }
+.toast { position:fixed; bottom:20px; right:20px; background:var(--fg); color:var(--bg);
+         padding:8px 14px; border-radius:8px; opacity:0; transition:opacity .2s }
+.toast.on { opacity:1 }
+@media (max-width:640px) { header, main { padding-left:16px; padding-right:16px } }
+</style></head><body>
+<header>
+  <h1>Efforts</h1>
+  <div class="stats">%(stats)s</div>
+  <div class="grow"></div>
+  <input id="q" placeholder="filter…" oninput="filter()" size="16">
+  <label class="meta"><input type="checkbox" id="closed" %(closed_checked)s onchange="toggleClosed()"> closed</label>
+  <button onclick="sync(this)">Sync GitHub</button>
+  <span class="meta">synced %(synced)s</span>
+</header>
+<main>%(body)s</main>
+<div class="toast" id="toast"></div>
+<script>
+function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('on');
+  setTimeout(()=>e.classList.remove('on'),1400)}
+function copy(btn){const t=btn.previousElementSibling.textContent;
+  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast('Copied'),
+  ()=>{const r=document.createRange();r.selectNode(btn.previousElementSibling);
+  getSelection().removeAllRanges();getSelection().addRange(r);document.execCommand('copy');toast('Copied')})}
+async function post(path,body){const r=await fetch(path,{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  if(!r.ok) throw new Error(await r.text()); return r.json()}
+async function setStatus(id,s){await post('/api/status',{id,status:s});location.reload()}
+async function setNote(id,cur){const n=prompt('Note',cur);if(n===null)return;
+  await post('/api/note',{id,note:n});location.reload()}
+async function addPr(id){const u=prompt('PR url');if(!u)return;
+  try{await post('/api/pr',{id,url:u});location.reload()}catch(e){toast(e.message)}}
+async function sync(b){b.disabled=true;b.textContent='Syncing…';
+  try{const r=await post('/api/sync');toast('Synced '+r.synced+'/'+r.total);location.reload()}
+  catch(e){toast(e.message);b.disabled=false;b.textContent='Sync GitHub'}}
+function toggleClosed(){const u=new URL(location);
+  document.getElementById('closed').checked?u.searchParams.set('closed','1'):u.searchParams.delete('closed');
+  location=u}
+function filter(){const q=document.getElementById('q').value.toLowerCase();
+  document.querySelectorAll('.card').forEach(c=>c.style.display=
+    c.textContent.toLowerCase().includes(q)?'':'none')}
+</script>
+</body></html>"""
+
+
+def e_(s):
+    return html.escape(str(s or ""), quote=True)
+
+
+def render_card(e):
+    closed = e["status"] in ("done", "dropped")
+    cls = "card" + (" hot" if e["flags"] else "") + (" closed" if closed else "")
+    prs = []
+    for p in e["prs"]:
+        bits = ['<span class="st %s">%s</span>' % (e_(p["state"]), e_(p["state"] or "unsynced"))]
+        if p["draft"]:
+            bits.append('<span class="st pending">draft</span>')
+        if p["state"] == "OPEN":
+            if p["checks"]:
+                bits.append('<span class="st %s">checks %s</span>' % (p["checks"], p["checks"]))
+            if p["review"] == "APPROVED":
+                bits.append('<span class="st pass">approved</span>')
+            elif p["review"] == "CHANGES_REQUESTED":
+                bits.append('<span class="st fail">changes requested</span>')
+            if p["mergeable"] == "CONFLICTING":
+                bits.append('<span class="st fail">conflict</span>')
+        prs.append('<div class="pr"><a href="%s" target="_blank">%s#%d</a> %s %s '
+                   '<span class="meta">updated %s ago</span></div>' % (
+                       e_(p["url"]), e_(p["repo"]), p["number"], e_(p["title"]),
+                       " ".join(bits), ago(p["pr_updated_at"])))
+    statuses = "".join(
+        '<button onclick="setStatus(%d,\'%s\')">%s</button>' % (e["id"], s, s)
+        for s in STATUSES if s != e["status"])
+    return """
+<div class="%(cls)s">
+  <div class="top">
+    <span class="id">#%(id)d</span><span class="title">%(title)s</span>
+    <span class="pill">%(status)s</span><span class="pill %(agent)s">%(agent)s</span>
+    <span class="meta">%(where)s · started %(created)s ago · active %(last)s ago</span>
+  </div>
+  %(flags)s
+  %(note)s
+  <div class="prs">%(prs)s</div>
+  %(cmd)s
+  <details><summary>initial prompt</summary><pre>%(prompt)s</pre></details>
+  <div class="actions">%(statuses)s
+    <button onclick="setNote(%(id)d, %(note_js)s)">note</button>
+    <button onclick="addPr(%(id)d)">+ PR</button></div>
+</div>""" % dict(
+        cls=cls, id=e["id"], title=e_(e["title"]), status=e_(e["status"]),
+        agent=e_(e["agent"] or "?"),
+        where=e_(" ".join(x for x in ((e["repo"] or os.path.basename(e["cwd"])), e["branch"]) if x)),
+        created=ago(e["created_at"]), last=ago(e["last_activity"]),
+        flags=('<div class="flags">%s</div>' % "".join(
+            '<span class="flag">%s</span>' % e_(f) for f in e["flags"])) if e["flags"] else "",
+        note=('<div class="note">📝 %s</div>' % e_(e["note"])) if e["note"] else "",
+        prs="".join(prs) or '<span class="meta">no PR linked yet</span>',
+        cmd=('<div class="cmd"><code>%s</code><button onclick="copy(this)">Copy</button></div>'
+             % e_(e["resume"])) if e["resume"] else "",
+        prompt=e_(e["prompt"] or "(not recorded)"), statuses=statuses,
+        note_js=e_(json.dumps(e["note"] or "")))
+
+
+def render(conn, include_closed):
+    efforts = load(conn, include_closed)
+    live = [e for e in efforts if e["status"] not in ("done", "dropped")]
+    open_prs = sum(1 for e in live for p in e["prs"] if p["state"] == "OPEN")
+    hot = sum(1 for e in live if e["flags"])
+    stats = "<span><b>%d</b> open efforts</span><span><b>%d</b> open PRs</span>" \
+            "<span><b>%d</b> need attention</span>" % (len(live), open_prs, hot)
+    groups = {}
+    for e in efforts:
+        groups.setdefault(e["epic"] or "", []).append(e)
+    body = []
+    for epic in sorted(groups, key=lambda k: (k == "", k.lower())):
+        if len(groups) > 1 or epic:
+            body.append('<div class="epic">%s</div>' % e_(epic or "No epic"))
+        body.extend(render_card(e) for e in groups[epic])
+    if not efforts:
+        body.append('<div class="empty">Nothing tracked yet. Agents register work with '
+                    '<code>gj start "title"</code>.</div>')
+    last = conn.execute("SELECT MAX(synced_at) FROM prs").fetchone()[0]
+    return PAGE % dict(stats=stats, body="".join(body), synced=ago(last) + " ago" if last else "never",
+                       closed_checked="checked" if include_closed else "")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype="application/json"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        conn = db()
+        if u.path == "/":
+            self.send(200, render(conn, "closed" in q), "text/html")
+        elif u.path == "/api/efforts":
+            self.send(200, json.dumps(load(conn, "closed" in q), default=str))
+        else:
+            self.send(404, '{"error":"not found"}')
+
+    def do_POST(self):
+        # Only accept same-origin JSON: blocks drive-by form posts from other sites.
+        if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            return self.send(415, '{"error":"json only"}')
+        n = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        conn = db()
+        try:
+            if self.path == "/api/sync":
+                r = sync_all(conn)
+                return self.send(200, json.dumps({k: r[k] for k in ("synced", "total")}))
+            eid = int(body["id"])
+            if self.path == "/api/status" and body.get("status") in STATUSES:
+                touch(conn, eid, status=body["status"])
+            elif self.path == "/api/note":
+                touch(conn, eid, note=str(body.get("note", "")))
+            elif self.path == "/api/pr":
+                url = add_pr_checked(conn, eid, str(body.get("url", "")))
+                sync_prs(conn, [url])
+            else:
+                return self.send(400, '{"error":"bad request"}')
+            conn.commit()
+            self.send(200, '{"ok":true}')
+        except (KeyError, ValueError) as ex:
+            self.send(400, json.dumps({"error": str(ex)}))
+
+
+def add_pr_checked(conn, eid, url):
+    if not PR_RE.search(url):
+        raise ValueError("not a GitHub PR url")
+    return add_pr(conn, eid, url)
+
+
+def cmd_serve(args):
+    conn = db()
+    if not args.no_sync:
+        def loop():
+            while True:
+                try:
+                    sync_all(db())
+                except Exception as ex:  # keep the dashboard up if gh hiccups
+                    print("gj: sync failed: %s" % ex, file=sys.stderr)
+                time.sleep(args.interval * 60)
+        threading.Thread(target=loop, daemon=True).start()
+    conn.close()
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = "http://127.0.0.1:%d/" % args.port
+    print("gj: dashboard at %s  (db: %s)" % (url, DB_PATH))
+    if args.open:
+        run(["open", url])
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------- install
+
+MARK_BEGIN = "<!-- gj:begin -->"
+MARK_END = "<!-- gj:end -->"
+INSTRUCTIONS = MARK_BEGIN + """
+## Effort tracking (gj)
+
+The user tracks every line of work that leads to a PR with the `gj` CLI, so no PR is forgotten.
+When a task will produce a pull request, do this without being asked:
+
+1. Before you start, register it: `gj start "<short title>" --prompt "<the user's request, verbatim>"`
+   (add `--epic "<name>"` if the user names a larger effort). Run it from the repo or worktree you work in.
+   Run it once per session; running it again only updates the title.
+2. Right after you open a PR: `gj pr <pr-url>`
+3. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
+   When the work is finished without a PR: `gj status done`.
+
+`gj` detects the agent and session on its own. If a `gj` command fails, mention it once and keep working.
+""" + MARK_END + "\n"
+
+TARGETS = {
+    "claude": HOME / ".claude/CLAUDE.md",
+    "codex": HOME / ".codex/AGENTS.md",
+    "grok": HOME / ".grok/AGENTS.md",
+}
+
+
+def cmd_install(args):
+    for agent in args.agents or AGENTS:
+        if agent not in TARGETS:
+            sys.exit("gj: unknown agent %s" % agent)
+        path = TARGETS[agent]
+        if not path.parent.exists():
+            print("gj: skip %s (%s missing)" % (agent, path.parent))
+            continue
+        text = path.read_text() if path.exists() else ""
+        if MARK_BEGIN in text:
+            text = re.sub(re.escape(MARK_BEGIN) + ".*?" + re.escape(MARK_END) + "\n?",
+                          lambda m: INSTRUCTIONS, text, flags=re.S)
+        elif args.uninstall:
+            continue
+        else:
+            text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + INSTRUCTIONS
+        if args.uninstall:
+            text = text.replace(INSTRUCTIONS, "").rstrip("\n") + "\n"
+        path.write_text(text)
+        print("gj: %s %s" % ("removed from" if args.uninstall else "installed in", path))
+        if agent == "codex":
+            codex_sandbox(args.uninstall)
+
+
+CODEX_BLOCK = '# gj:begin\n[sandbox_workspace_write]\nwritable_roots = [%s]\n# gj:end\n'
+
+
+def codex_sandbox(uninstall):
+    """Codex's default sandbox only writes inside the workspace; let it write the gj db."""
+    cfg = HOME / ".codex/config.toml"
+    text = cfg.read_text() if cfg.exists() else ""
+    block = CODEX_BLOCK % json.dumps(str(DB_PATH.parent))
+    if uninstall:
+        cfg.write_text(re.sub(r"\n?# gj:begin\n.*?# gj:end\n", "", text, flags=re.S))
+    elif "# gj:begin" in text:
+        return
+    elif "[sandbox_workspace_write]" in text:
+        print("gj: add %s to [sandbox_workspace_write] writable_roots in %s"
+              % (DB_PATH.parent, cfg))
+    else:
+        cfg.write_text(text.rstrip("\n") + "\n\n" + block)
+        print("gj: let codex sandbox write %s (%s)" % (DB_PATH.parent, cfg))
+
+
+# ---------------------------------------------------------------- cli
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="gj", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("start", help="register the current agent session's work")
+    p.add_argument("title")
+    p.add_argument("--prompt", help="the initial request (auto-read from agent logs if omitted)")
+    p.add_argument("--epic")
+    p.add_argument("--pr", action="append", help="PR url to link right away")
+    p.add_argument("--agent", choices=AGENTS, help="override detected agent")
+    p.add_argument("--session", help="override detected session id")
+    p.add_argument("--cwd", help="override working directory")
+    p.add_argument("--new", action="store_true", help="always create a new effort")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("pr", help="link PR url(s) to the current effort")
+    p.add_argument("urls", nargs="+")
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_pr)
+
+    p = sub.add_parser("status", help="set status: " + ", ".join(STATUSES))
+    p.add_argument("status", choices=STATUSES)
+    p.add_argument("--note")
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("note", help="set the effort's note")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser("edit", help="change title / epic / prompt")
+    p.add_argument("--id", type=int)
+    p.add_argument("--title")
+    p.add_argument("--epic")
+    p.add_argument("--prompt")
+    p.set_defaults(fn=cmd_edit)
+
+    p = sub.add_parser("rm", help="delete an effort")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_rm)
+
+    p = sub.add_parser("ls", help="list efforts")
+    p.add_argument("-a", "--all", action="store_true", help="include done/dropped")
+    p.add_argument("-s", "--sync", action="store_true", help="sync GitHub first")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("resume", help="print the command that reopens an effort's session")
+    p.add_argument("id", type=int)
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("sync", help="refresh PR state from GitHub, discover PRs by branch")
+    p.add_argument("--all", action="store_true", help="also re-sync closed PRs")
+    p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("serve", help="run the dashboard")
+    p.add_argument("--port", type=int, default=int(os.environ.get("GJ_PORT", "7777")))
+    p.add_argument("--interval", type=float, default=10, help="minutes between GitHub syncs")
+    p.add_argument("--no-sync", action="store_true")
+    p.add_argument("--open", action="store_true", help="open in browser")
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("install", help="add gj instructions to agents' global instruction files")
+    p.add_argument("agents", nargs="*", help="subset of: " + ", ".join(AGENTS))
+    p.add_argument("--uninstall", action="store_true")
+    p.set_defaults(fn=cmd_install)
+
+    args = ap.parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
