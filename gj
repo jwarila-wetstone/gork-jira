@@ -891,12 +891,17 @@ a.chip:hover { text-decoration:underline }
 .chip.ok { background:var(--worksoft); color:var(--work) }
 .chip.bad { background:var(--badsoft); color:var(--bad) }
 .chip.merged { background:var(--shipsoft); color:var(--ship) }
-.stg { display:inline-flex; gap:2px; align-items:center; margin-right:5px; flex:none }
-.stg i { width:7px; height:4px; border-radius:1px; background:var(--line) }
-.stg i.d { background:var(--faint) } .stg i.c { background:var(--fg) }
-.card.working .stg i.c { background:var(--work) } .card.you .stg i.c { background:var(--you) }
-.card.review .stg i.c { background:var(--rev) }
-.stg em { font-style:normal; font-size:10.5px; color:var(--mut); margin-left:4px }
+.steps { display:flex; align-items:center; gap:8px; margin-top:7px }
+.bar { flex:1; display:flex; gap:2px; min-width:60px }
+.bar i { flex:1; height:4px; border-radius:2px; background:var(--line) }
+.bar i.d { background:color-mix(in srgb, var(--mut) 55%, transparent) }
+.bar i.c { background:var(--fg) }
+.card.working .bar i.c { background:var(--work) } .card.you .bar i.c { background:var(--you) }
+.card.review .bar i.c { background:var(--rev) }
+.card .bar i.c.bad { background:var(--bad) }
+.steps .lbl { flex:none; font-size:11px; color:var(--mut); white-space:nowrap; font-variant-numeric:tabular-nums }
+.steps .lbl b { font-weight:600; color:var(--fg) }
+.steps .lbl.bad b { color:var(--bad) }
 .path { display:flex; flex-wrap:wrap; gap:3px 0; font-size:12px; color:var(--faint) }
 .path span + span::before { content:"›"; margin:0 5px; color:var(--line) }
 .path .d { color:var(--mut) } .path .c { color:var(--fg); font-weight:650 }
@@ -969,11 +974,15 @@ const STATUSES = ['active', 'review', 'blocked', 'done', 'dropped'];
 const STAGES = ['plan', 'build', 'verify', 'review', 'pr', 'codex', 'human', 'merge'];
 const STAGE_NAMES = {plan: 'Plan', build: 'Build', verify: 'Verify', review: 'Self-review', pr: 'PR',
   codex: 'Codex review', human: 'Human approval', merge: 'Merge'};
+// Something on GitHub stops this stage from moving (failing checks, conflict, changes requested).
+const BLOCKERS = /checks failing|merge conflict|changes requested/;
 function strip(e) {
   const i = STAGES.indexOf(e.stage);
   if (i < 0) return '';
-  return `<span class="stg" title="Stage ${i + 1} of ${STAGES.length}: ${STAGE_NAMES[e.stage]}">` +
-    STAGES.map((s, j) => `<i class="${j < i ? 'd' : j === i ? 'c' : ''}"></i>`).join('') + `<em>${esc(e.stage)}</em></span>`;
+  const bad = e.flags.some(f => BLOCKERS.test(f));
+  return `<div class="steps"><div class="bar">` +
+    STAGES.map((s, j) => `<i class="${j < i ? 'd' : j === i ? 'c' + (bad ? ' bad' : '') : ''}" title="${j + 1}. ${STAGE_NAMES[s]}${j < i ? ' ✓' : j === i ? ' (now)' : ''}"></i>`).join('') +
+    `</div><span class="lbl ${bad ? 'bad' : ''}">${i + 1}/${STAGES.length} <b>${STAGE_NAMES[e.stage]}</b>${bad ? ' · blocked' : ''}</span></div>`;
 }
 function path(e) {
   const i = STAGES.indexOf(e.stage);
@@ -1022,7 +1031,8 @@ function card(e) {
   return `<article class="card ${e.lane} ${openId === e.id ? 'sel' : ''}" data-id="${e.id}">
     <div class="r1"><i class="ag ${esc(e.agent)}" title="${esc(e.agent)}"></i><span class="title">${esc(e.title)}</span><span class="age">${ago(e.last_activity)}</span></div>
     ${sub}
-    <div class="meta">${strip(e)}<span class="where" title="${esc(where(e, true))}">${esc(where(e))}</span>${openPrs(e).map(prChip).join('')}</div>
+    ${strip(e)}
+    <div class="meta"><span class="where" title="${esc(where(e, true))}">${esc(where(e))}</span>${openPrs(e).map(prChip).join('')}</div>
   </article>`;
 }
 function row(e) {
