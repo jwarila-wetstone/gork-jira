@@ -698,16 +698,16 @@ def lane(e):
     open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
     if live.get("state") == "working":
         return "working", ""
+    urgent = [f for f in e["flags"]
+              if " stale " not in " %s " % f and "idle" not in f and f != "blocked"]
+    if urgent:   # failing checks, conflict, changes requested: auto-merge can't finish these
+        return "you", urgent[0]
     if open_prs and all(p.get("auto_merge") for p in open_prs):
-        # You turned on auto-merge, so it's handed off (even if an agent left it 'blocked');
-        # GitHub merges it when it can, and any problem still shows on the card.
-        problems = [f for f in e["flags"] if f != "blocked"]
-        return "review", problems[0] if problems else "auto-merge on"
+        # You turned on auto-merge and nothing blocks it, so it's handed off
+        # (even if an agent left the effort 'blocked').
+        return "review", "auto-merge on"
     if e["status"] == "blocked":
         return "you", e["note"] or "blocked"
-    urgent = [f for f in e["flags"] if " stale " not in " %s " % f and "idle" not in f]
-    if urgent:
-        return "you", urgent[0]
     if live.get("state") == "stalled" and now() - live["seen"] < 86400:
         return "you", "agent stopped mid-task (approval prompt or crash?)"
     last = max(e["updated_at"], live.get("seen") or 0,

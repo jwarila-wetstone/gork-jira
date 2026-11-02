@@ -141,7 +141,10 @@ class Live(unittest.TestCase):
         self.assertEqual(gj.lane(dict(e(prs=[am]), live=live("done"))), ("review", "auto-merge on"))
         bad = pr(checks="fail", auto_merge="SQUASH")
         self.assertEqual(gj.lane(dict(e(prs=[bad]), live=live("done"))),
-                         ("review", "#7 checks failing"))
+                         ("you", "#7 checks failing"))
+        conflict = pr(mergeable="CONFLICTING", auto_merge="SQUASH")
+        self.assertEqual(gj.lane(dict(e(prs=[conflict]), live=live("done"))),
+                         ("you", "#7 merge conflict"))
         blocked = dict(e(prs=[am]), status="blocked", note="waiting on go", live=live("done"))
         self.assertEqual(gj.lane(blocked), ("review", "auto-merge on"))
         mixed = [am, pr(number=8, checks="fail")]
