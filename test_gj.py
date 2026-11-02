@@ -183,6 +183,35 @@ class Stages(unittest.TestCase):
         e["stage"] = "codex"
         self.assertEqual(gj.lane(e)[0], "review")
 
+    def test_report_after_pr_wins(self):
+        merged = pr(state="MERGED", pr_updated_at=1000)
+        # reported before the PR moved: GitHub's view (merged) wins
+        self.assertEqual(gj.stage_of(effort(stage="review", stage_at=500, prs=[merged])), "merge")
+        # reported after: the agent is on the next piece
+        self.assertEqual(gj.stage_of(effort(stage="build", stage_at=2000, prs=[merged])), "build")
+
+    def test_long_effort_stays_open(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, status, stage, stage_at, created_at, "
+                           "updated_at) VALUES ('long', 'active', 'build', 2000, 0, 0)").lastrowid
+        gj.add_pr(conn, eid, "https://github.com/a/b/pull/50")
+        conn.execute("UPDATE prs SET state = 'MERGED', pr_updated_at = 1000 WHERE number = 50")
+        self.assertNotIn((eid, "done"), gj.auto_close(conn))
+        conn.execute("UPDATE efforts SET stage_at = 500 WHERE id = ?", (eid,))
+        self.assertIn((eid, "done"), gj.auto_close(conn))
+
+    def test_start_attach(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, status, agent, session_id, created_at, "
+                           "updated_at) VALUES ('old', 'done', 'claude', 's1', 0, 0)").lastrowid
+        conn.commit()
+        args = type("A", (), dict(id=eid, title=None, prompt=None, epic=None, pr=None,
+                                  agent="codex", session="s2", cwd="/tmp", new=False))
+        gj.cmd_start(args)
+        row = gj.db().execute("SELECT * FROM efforts WHERE id = ?", (eid,)).fetchone()
+        self.assertEqual((row["title"], row["agent"], row["session_id"], row["status"]),
+                         ("old", "codex", "s2", "active"))
+
     def test_stage_cmd(self):
         conn = gj.db()
         eid = conn.execute("INSERT INTO efforts(title, status, stage, created_at, updated_at) "

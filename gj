@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS efforts (
     repo        TEXT NOT NULL DEFAULT '',
     branch      TEXT NOT NULL DEFAULT '',
     stage       TEXT NOT NULL DEFAULT '',
+    stage_at    REAL NOT NULL DEFAULT 0,    -- when the agent last reported a stage
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -83,8 +84,11 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(prs)")}
     if "auto_merge" not in cols:
         conn.execute("ALTER TABLE prs ADD COLUMN auto_merge TEXT NOT NULL DEFAULT ''")
-    if "stage" not in {r[1] for r in conn.execute("PRAGMA table_info(efforts)")}:
+    ecols = {r[1] for r in conn.execute("PRAGMA table_info(efforts)")}
+    if "stage" not in ecols:
         conn.execute("ALTER TABLE efforts ADD COLUMN stage TEXT NOT NULL DEFAULT ''")
+    if "stage_at" not in ecols:
+        conn.execute("ALTER TABLE efforts ADD COLUMN stage_at REAL NOT NULL DEFAULT 0")
     return conn
 
 
@@ -300,31 +304,45 @@ def cmd_start(args):
     repo, branch = git_info(cwd)
     prompt = args.prompt or (first_user_prompt(agent, sid, cwd) if sid else "")
     existing = None
-    if agent and sid:
+    if args.id:
+        existing = conn.execute("SELECT * FROM efforts WHERE id = ?", (args.id,)).fetchone()
+        if not existing:
+            sys.exit("gj: no effort #%s" % args.id)
+    elif not args.title:
+        sys.exit("gj: give a title, or --id N to continue an existing effort")
+    elif agent and sid:
         existing = conn.execute(
             "SELECT id FROM efforts WHERE agent = ? AND session_id = ? AND status IN (%s) "
             "ORDER BY id DESC LIMIT 1" % ",".join("?" * len(OPEN_STATUSES)),
             (agent, sid, *OPEN_STATUSES)).fetchone()
     if existing and not args.new:
         eid = existing["id"]
-        fields = dict(title=args.title, cwd=cwd, repo=repo, branch=branch)
+        fields = dict(cwd=cwd, repo=repo, branch=branch)
+        if args.title:
+            fields["title"] = args.title
+        if args.id:   # this session now carries the effort: resume points here
+            fields.update(agent=agent, session_id=sid)
+            if existing["status"] in ("done", "dropped"):
+                fields["status"] = "active"
         if args.prompt:
             fields["prompt"] = args.prompt
         if args.epic:
             fields["epic"] = args.epic
         touch(conn, eid, **fields)
-        verb = "updated"
+        verb = "attached to" if args.id else "updated"
     else:
         t = now()
         eid = conn.execute(
             "INSERT INTO efforts(title, prompt, epic, agent, session_id, cwd, repo, branch, stage, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, "plan", t, t)).lastrowid
+            "stage_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, "plan",
+             t, t, t)).lastrowid
         verb = "started"
     for url in args.pr or []:
         add_pr(conn, eid, url)
     conn.commit()
-    print("gj: %s effort #%d [%s %s] %s" % (verb, eid, agent or "?", sid[:8] or "-", args.title))
+    title = args.title or existing["title"]
+    print("gj: %s effort #%d [%s %s] %s" % (verb, eid, agent or "?", sid[:8] or "-", title))
 
 
 def cmd_pr(args):
@@ -355,7 +373,7 @@ def cmd_status(args):
 def cmd_stage(args):
     conn = db()
     e = current_effort(conn, args)
-    fields = {"stage": args.stage}
+    fields = {"stage": args.stage, "stage_at": now()}
     if args.note is not None:
         fields["note"] = args.note
     if e["status"] == "blocked":
@@ -369,6 +387,9 @@ def stage_of(e):
     """The furthest stage the effort has reached: the agent's report, or GitHub's if further."""
     s = e.get("stage") or ""
     rank = STAGES.index(s) if s in STAGES else -1
+    last_pr = max([p["pr_updated_at"] for p in e["prs"]] or [0])
+    if s and (e.get("stage_at") or 0) > last_pr:
+        return s   # the agent reported after the last PR moved: it's on the next piece
 
     def reach(x):
         nonlocal s, rank
@@ -486,7 +507,7 @@ def auto_close(conn):
     A blocked effort closes too when its last PR closed after it was blocked: the block was
     about getting the PR out. A block set after the merge (follow-up work) stays open."""
     rows = conn.execute(
-        "SELECT e.id, e.status, e.updated_at, SUM(p.state = 'MERGED') merged, "
+        "SELECT e.id, e.status, e.updated_at, e.stage_at, SUM(p.state = 'MERGED') merged, "
         "SUM(p.state IN ('MERGED','CLOSED')) shut, COUNT(*) n, MAX(p.pr_updated_at) last_pr "
         "FROM efforts e JOIN prs p ON p.effort_id = e.id "
         "WHERE e.status IN ('active','review','blocked') GROUP BY e.id").fetchall()
@@ -494,6 +515,8 @@ def auto_close(conn):
     for r in rows:
         if r["status"] == "blocked" and (not r["merged"] or (r["last_pr"] or 0) <= r["updated_at"]):
             continue   # never auto-drop a blocked effort; its PR may come back in another form
+        if (r["stage_at"] or 0) > (r["last_pr"] or 0):
+            continue   # the agent reported work after the last PR: a long effort, still going
         if r["n"] and r["shut"] == r["n"]:
             status = "done" if r["merged"] else "dropped"
             touch(conn, r["id"], status=status)
@@ -1227,13 +1250,20 @@ MARK_END = "<!-- gj:end -->"
 INSTRUCTIONS = MARK_BEGIN + """
 ## Effort tracking and workflow (gj)
 
-The user tracks every line of work that leads to a PR with the `gj` CLI, so no PR is forgotten,
-and moves each one through the same stages. When a task will produce a pull request, do this
-without being asked:
+The user tracks building work with the `gj` CLI, so no PR is forgotten, and moves it through the
+same stages.
+
+**What enters the flow:** only work that builds something, meaning a code change that will go into a PR.
+Questions, investigations, debugging, reviews and explanations are normal work: don't register them or
+use the stages. If one of them ends with a change the user wants built, enter the flow then, starting at
+`plan` with what you found.
+
+For building work, do this without being asked:
 
 1. Before you start, register it: `gj start "<short title>" --prompt "<the user's request, verbatim>"`
    (add `--epic "<name>"` if the user names a larger effort). Run it from the repo or worktree you work in.
    Run it once per session; running it again only updates the title. New work starts at the `plan` stage.
+   If the user says this session continues effort #N, attach to it instead: `gj start --id N`.
 2. Report each stage as you enter it with `gj stage <stage>`:
 
    | Stage | What you do | Move on when |
@@ -1245,6 +1275,8 @@ without being asked:
    | `codex` | The Codex review loop below. | `gj stage human` |
    | `human`, `merge` | Nothing. gj follows approval and merge on GitHub. | |
 
+   A long effort goes around more than once. When one PR is out and the next piece starts, report
+   `gj stage plan` (or `build`) again. The effort stays open while you report work after its last PR.
 3. **Codex review loop.** Codex reviews the PR on GitHub when it opens. Each round:
    - Read its review comments with `gh`. Fix the real findings and re-run the verification the fix touches.
      Reply on the thread to any finding you disagree with, saying why.
@@ -1378,7 +1410,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("start", help="register the current agent session's work")
-    p.add_argument("title")
+    p.add_argument("title", nargs="?")
+    p.add_argument("--id", type=int, help="continue effort N in this session instead")
     p.add_argument("--prompt", help="the initial request (auto-read from agent logs if omitted)")
     p.add_argument("--epic")
     p.add_argument("--pr", action="append", help="PR url to link right away")
