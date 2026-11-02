@@ -10,7 +10,6 @@ dashboard, with a copyable command to jump back into each session.
 """
 import argparse
 import concurrent.futures
-import html
 import json
 import os
 import re
@@ -552,184 +551,507 @@ def cmd_resume(args):
     print(resume_cmd(e))
 
 
+# ---------------------------------------------------------------- live activity
+#
+# What is each agent doing right now? Read the tail of its own session log:
+# how recently it was written, whether the last turn finished, and its latest action.
+
+WORKING_SECS = 120          # log written this recently + turn not finished = working
+_log_paths = {}
+
+
+def tail_lines(path, nbytes=262144):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        data = f.read().decode("utf-8", "replace")
+    lines = data.splitlines()
+    return lines[1:] if size > nbytes else lines   # first line may be cut
+
+
+def clip(s, n=160):
+    s = " ".join(str(s or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def session_log(e):
+    key = (e["agent"], e["session_id"])
+    p = _log_paths.get(key)
+    if p and p.exists():
+        return p
+    p, sid, cwd = None, e["session_id"], e["cwd"]
+    if not sid:
+        return None
+    if e["agent"] == "claude":
+        p = HOME / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd) / (sid + ".jsonl")
+        if not p.exists():
+            p = next((HOME / ".claude/projects").glob("*/%s.jsonl" % sid), None)
+    elif e["agent"] == "codex":
+        p = next((HOME / ".codex/sessions").glob("*/*/*/rollout-*%s.jsonl" % sid), None)
+    elif e["agent"] == "grok":
+        p = HOME / ".grok/sessions" / urllib.parse.quote(cwd, safe="") / sid / "chat_history.jsonl"
+        if not p.exists():
+            p = next((HOME / ".grok/sessions").glob("*/%s/chat_history.jsonl" % sid), None)
+    if p and p.exists():
+        _log_paths[key] = p
+        return p
+    return None
+
+
+def claude_turn(entries):
+    """(turn_done, latest action) from Claude transcript entries, newest last."""
+    done, doing = None, ""
+    for d in reversed(entries):
+        t = d.get("type")
+        if t not in ("user", "assistant") or d.get("isMeta"):
+            continue
+        content = d.get("message", {}).get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        kinds = {b.get("type") for b in blocks if isinstance(b, dict)}
+        if done is None:
+            done = t == "assistant" and "text" in kinds and "tool_use" not in kinds
+        for b in reversed(blocks):
+            if not isinstance(b, dict):
+                continue
+            if t == "assistant" and b.get("type") == "tool_use":
+                inp = b.get("input") or {}
+                detail = (inp.get("description") or inp.get("file_path") or inp.get("pattern")
+                          or inp.get("command") or inp.get("prompt") or "")
+                name = b.get("name", "").split("__")[-1]
+                doing = "%s: %s" % (name, detail) if detail else name
+            elif t == "assistant" and b.get("type") == "text" and b.get("text", "").strip():
+                doing = b["text"]
+            if doing:
+                return done, clip(doing)
+    return bool(done), doing
+
+
+def codex_turn(entries):
+    done, doing = None, ""
+    for d in reversed(entries):
+        p = d.get("payload") or {}
+        if done is None and d.get("type") == "event_msg" and p.get("type") in (
+                "task_complete", "task_started", "turn_aborted"):
+            done = p["type"] != "task_started"
+        if not doing and d.get("type") == "response_item":
+            if p.get("type") == "message" and p.get("role") == "assistant":
+                doing = " ".join(c.get("text", "") for c in p.get("content") or [])
+            elif p.get("type") in ("function_call", "custom_tool_call", "local_shell_call"):
+                doing = "%s: %s" % (p.get("name") or "shell", p.get("arguments") or p.get("input") or "")
+        if done is not None and doing:
+            break
+    return bool(done), clip(doing)
+
+
+def grok_turn(entries):
+    done, doing = None, ""
+    for d in reversed(entries):
+        t = d.get("type")
+        if done is None and t in ("assistant", "tool_result", "user"):
+            done = t == "assistant" and not d.get("tool_calls")
+        if not doing and t == "assistant":
+            calls = d.get("tool_calls") or []
+            if d.get("content"):
+                doing = d["content"]
+            elif calls:
+                doing = calls[-1].get("name", "")
+        if done is not None and doing:
+            break
+    return bool(done), clip(doing)
+
+
+def liveness(e):
+    """{'seen': ts, 'state': working|stalled|done|'' , 'doing': str} for an effort's session."""
+    p = session_log(e)
+    if not p:
+        return {"seen": 0, "state": "", "doing": ""}
+    try:
+        seen = p.stat().st_mtime
+        entries = []
+        for line in tail_lines(p):
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                pass
+    except OSError:
+        return {"seen": 0, "state": "", "doing": ""}
+    fn = {"claude": claude_turn, "codex": codex_turn, "grok": grok_turn}[e["agent"]]
+    done, doing = fn(entries)
+    if done:
+        state = "done"
+    else:
+        state = "working" if now() - seen < WORKING_SECS else "stalled"
+    return {"seen": seen, "state": state, "doing": doing}
+
+
+def lane(e):
+    """Which board column an open effort belongs in, and why."""
+    live = e.get("live") or {}
+    open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
+    if live.get("state") == "working":
+        return "working", ""
+    if e["status"] == "blocked":
+        return "you", e["note"] or "blocked"
+    urgent = [f for f in e["flags"] if " stale " not in " %s " % f and "idle" not in f]
+    if urgent:
+        return "you", urgent[0]
+    if live.get("state") == "stalled" and now() - live["seen"] < 86400:
+        return "you", "agent stopped mid-task (approval prompt or crash?)"
+    last = max(e["updated_at"], live.get("seen") or 0,
+               *[p["pr_updated_at"] for p in open_prs])
+    quiet = now() - last > STALE_DAYS * 86400
+    why = e["flags"][0] if e["flags"] else ""
+    if open_prs and not quiet:
+        return "review", why
+    if not open_prs and live.get("state") == "done" and now() - live["seen"] < 86400:
+        return "you", "agent finished its turn and is waiting on you"
+    return "idle", why
+
+
+def board(conn):
+    efforts = load(conn, include_closed=True)
+    week = now() - 7 * 86400
+    out = []
+    for e in efforts:
+        closed = e["status"] in ("done", "dropped")
+        if closed and e["updated_at"] < week:
+            continue
+        e["live"] = liveness(e) if not closed else {"seen": 0, "state": "", "doing": ""}
+        e["lane"], e["why"] = ("shipped", "") if closed else lane(e)
+        e["last_activity"] = max(e["last_activity"], e["live"]["seen"])
+        out.append(e)
+    last = conn.execute("SELECT MAX(synced_at) FROM prs").fetchone()[0]
+    return {"now": now(), "synced": last or 0, "efforts": out}
+
+
 # ---------------------------------------------------------------- dashboard
 
-PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Efforts</title>
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>gj</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='6' fill='%2322a06b'/></svg>">
 <style>
-:root { --bg:#f7f7f5; --card:#fff; --fg:#1d1d1b; --mut:#6b6b66; --line:#e3e3de;
-        --warn:#b4540a; --warnbg:#fdf1e4; --bad:#b3261e; --badbg:#fbe9e7; --ok:#1e7a3a;
-        --okbg:#e6f4ea; --acc:#2f5bd3; --code:#f0f0ec; }
-@media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --fg:#ececea;
-        --mut:#9a9a94; --line:#33332f; --warn:#f0a35c; --warnbg:#3a2a18; --bad:#f28b82;
-        --badbg:#3c1f1d; --ok:#81c995; --okbg:#1c3324; --acc:#8ab4f8; --code:#2a2a27; } }
+:root { --bg:#f6f6f3; --panel:#ffffff; --fg:#1b1b19; --mut:#6d6d67; --faint:#9b9b94; --line:#e4e4de;
+  --soft:#efefea; --work:#1f8a5b; --worksoft:#e3f3ea; --you:#b5530b; --yousoft:#fcefe2;
+  --rev:#2f5bd3; --revsoft:#e7edfb; --idle:#7b7b74; --ship:#6e40c9; --shipsoft:#efe8fb;
+  --bad:#b3261e; --badsoft:#fbe9e7; --shade:rgba(0,0,0,.25);
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#121211; --panel:#1b1b1a;
+  --fg:#ececea; --mut:#a2a29b; --faint:#77776f; --line:#2b2b28; --soft:#252523; --work:#5fd39a;
+  --worksoft:#16301f; --you:#f2a65e; --yousoft:#36261a; --rev:#8ab4f8; --revsoft:#1b2638;
+  --idle:#9a9a93; --ship:#c3a6f5; --shipsoft:#2a2138; --bad:#f28b82; --badsoft:#3c1f1d; --shade:rgba(0,0,0,.5); } }
 * { box-sizing:border-box }
-body { margin:0; background:var(--bg); color:var(--fg);
-       font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-header { display:flex; gap:12px; align-items:center; flex-wrap:wrap; padding:16px 24px;
-         border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:1 }
-h1 { font-size:18px; margin:0 12px 0 0 }
-.stats span { margin-right:14px; color:var(--mut) } .stats b { color:var(--fg) }
+html, body { height:100% }
+body { margin:0; background:var(--bg); color:var(--fg); display:flex; flex-direction:column; overflow:hidden;
+  font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif; -webkit-font-smoothing:antialiased }
+a { color:inherit }
+button, input { font:inherit; color:inherit }
+
+/* ---- top bar: brand, live counts, tools ---- */
+header { flex:none; display:flex; align-items:center; gap:4px 14px; padding:7px 12px; border-bottom:1px solid var(--line); flex-wrap:wrap }
+.brand { font-weight:700; font-size:14px; display:flex; align-items:center; gap:6px }
+.brand i { width:7px; height:7px; border-radius:50%; background:var(--work) }
+.brand.off i { background:var(--bad) }
+.counts { display:flex; gap:12px; flex-wrap:wrap }
+.count { display:flex; align-items:baseline; gap:4px; color:var(--mut); font-size:12px; white-space:nowrap }
+.count b { font-size:15px; font-weight:650; font-variant-numeric:tabular-nums }
+.count.working b { color:var(--work) } .count.you b { color:var(--you) } .count.review b { color:var(--rev) }
+.count.idle b { color:var(--idle) } .count.shipped b { color:var(--ship) } .count.zero b { color:var(--faint) }
 .grow { flex:1 }
-button, select, input { font:inherit; color:inherit; background:var(--card);
-         border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer }
-input { cursor:text }
-button:hover { border-color:var(--acc) }
-main { padding:16px 24px; max-width:1200px; margin:0 auto }
-.epic { margin:22px 0 8px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--mut) }
-.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px;
-        margin-bottom:10px }
-.card.hot { border-left:4px solid var(--warn) }
-.card.closed { opacity:.6 }
-.top { display:flex; gap:10px; align-items:baseline; flex-wrap:wrap }
-.id { color:var(--mut); font-variant-numeric:tabular-nums }
-.title { font-weight:600; font-size:15px }
-.pill { font-size:12px; padding:1px 8px; border-radius:99px; background:var(--code); color:var(--mut) }
-.pill.claude{color:#c96442} .pill.codex{color:#10a37f} .pill.grok{color:var(--fg)}
-.meta { color:var(--mut); font-size:12px }
-.flags { margin:8px 0 0; display:flex; gap:6px; flex-wrap:wrap }
-.flag { font-size:12px; padding:2px 8px; border-radius:6px; background:var(--warnbg); color:var(--warn) }
-.prs { margin-top:8px; display:flex; flex-direction:column; gap:3px }
-.pr { font-size:13px } .pr a { color:var(--acc); text-decoration:none } .pr a:hover { text-decoration:underline }
-.st { font-size:11px; font-weight:600; padding:0 6px; border-radius:4px; margin-left:4px }
-.st.OPEN{background:var(--okbg);color:var(--ok)} .st.MERGED{background:#ece4fb;color:#6e40c9}
-.st.CLOSED{background:var(--badbg);color:var(--bad)} .st.fail{background:var(--badbg);color:var(--bad)}
-.st.pass{background:var(--okbg);color:var(--ok)} .st.pending{background:var(--code);color:var(--mut)}
-.st.warn{background:var(--warnbg);color:var(--warn)}
-.cmd { margin-top:10px; display:flex; gap:6px; align-items:stretch }
-.cmd code { flex:1; background:var(--code); border-radius:6px; padding:5px 9px; overflow-x:auto;
-            white-space:nowrap; font:12px ui-monospace,SFMono-Regular,Menlo,monospace }
-details { margin-top:8px } summary { cursor:pointer; color:var(--mut); font-size:12px }
-pre { white-space:pre-wrap; background:var(--code); padding:8px 10px; border-radius:6px;
-      font:12px ui-monospace,SFMono-Regular,Menlo,monospace; max-height:300px; overflow:auto }
-.note { margin-top:6px; font-size:13px }
-.actions { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap }
-.actions button { font-size:12px; padding:2px 8px }
-.empty { color:var(--mut); padding:40px 0; text-align:center }
-.toast { position:fixed; bottom:20px; right:20px; background:var(--fg); color:var(--bg);
-         padding:8px 14px; border-radius:8px; opacity:0; transition:opacity .2s }
+.tools { display:flex; gap:8px; align-items:center }
+#q { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:3px 8px; width:130px; font-size:12px }
+#q:focus { outline:none; border-color:var(--rev) }
+.btn { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:3px 9px; cursor:pointer; font-size:12px; white-space:nowrap }
+.btn:hover { border-color:var(--fg) }
+.btn:disabled { opacity:.5; cursor:default }
+#synced { color:var(--faint); font-size:11px; white-space:nowrap }
+
+/* ---- board: columns fill the window and scroll on their own ---- */
+.board { flex:1; min-height:0; display:grid; gap:10px; padding:10px 12px 0 }
+.lane { min-height:0; display:flex; flex-direction:column }
+.lane h2 { flex:none; font-size:11px; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:var(--mut);
+  margin:0 0 7px; display:flex; align-items:center; gap:6px; white-space:nowrap }
+.lane h2 i { width:7px; height:7px; border-radius:50% }
+.lane h2 .n { color:var(--faint); font-variant-numeric:tabular-nums }
+.lane.working h2 i { background:var(--work) } .lane.you h2 i { background:var(--you) }
+.lane.review h2 i { background:var(--rev) } .lane.rest h2 i { background:var(--idle) }
+.scroll { flex:1; min-height:0; overflow-y:auto; padding-bottom:12px; scrollbar-width:thin }
+.hint { color:var(--faint); font-size:12px; padding:10px; border:1px dashed var(--line); border-radius:8px; text-align:center }
+
+.card { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--line); border-radius:8px;
+  padding:7px 10px 8px; margin-bottom:6px; cursor:pointer }
+.card:hover, .card.sel { border-color:var(--faint) }
+.card.working { border-left-color:var(--work) } .card.you { border-left-color:var(--you) }
+.card.review { border-left-color:var(--rev) }
+.card.working:hover, .card.working.sel { border-left-color:var(--work) }
+.card.you:hover, .card.you.sel { border-left-color:var(--you) }
+.card.review:hover, .card.review.sel { border-left-color:var(--rev) }
+.r1 { display:flex; gap:6px; align-items:baseline }
+.title { font-weight:600; flex:1; min-width:0; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden }
+.age { color:var(--faint); font-size:11px; font-variant-numeric:tabular-nums; white-space:nowrap }
+.sub { margin-top:3px; font-size:12px; display:flex; gap:6px; align-items:flex-start }
+.sub span { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden }
+.card.working .sub span { color:var(--fg) }
+.card.you .sub span { color:var(--you); font-weight:550 }
+.card.review .sub span { color:var(--mut) }
+.pulse { flex:none; width:7px; height:7px; margin-top:5px; border-radius:50%; background:var(--work); position:relative }
+.pulse::after { content:""; position:absolute; inset:-4px; border-radius:50%; border:2px solid var(--work);
+  opacity:0; animation:ping 1.6s ease-out infinite }
+@keyframes ping { 0% { transform:scale(.5); opacity:.7 } 100% { transform:scale(1.4); opacity:0 } }
+@media (prefers-reduced-motion: reduce) { .pulse::after { animation:none } }
+.meta { margin-top:5px; display:flex; gap:4px; align-items:center; flex-wrap:wrap; font-size:11px; color:var(--faint) }
+.where { font-family:var(--mono); font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; max-width:100%; margin-right:2px }
+.chip { font-size:10.5px; padding:0 6px; border-radius:99px; background:var(--soft); color:var(--mut); text-decoration:none; white-space:nowrap; line-height:17px }
+a.chip:hover { text-decoration:underline }
+.chip.ok { background:var(--worksoft); color:var(--work) }
+.chip.bad { background:var(--badsoft); color:var(--bad) }
+.chip.merged { background:var(--shipsoft); color:var(--ship) }
+.ag { flex:none; width:6px; height:6px; border-radius:50%; background:var(--faint); align-self:center }
+.ag.claude { background:#d97757 } .ag.codex { background:#10a37f } .ag.grok { background:var(--fg) }
+
+/* ---- the quiet/closed column: one line per effort ---- */
+.row { display:flex; gap:6px; align-items:baseline; padding:4px 6px; border-radius:6px; cursor:pointer; font-size:12px }
+.row:hover, .row.sel { background:var(--soft) }
+.row .t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--mut) }
+.row .t.dropped { text-decoration:line-through; color:var(--faint) }
+.row .why { color:var(--faint); font-size:11px; white-space:nowrap; max-width:45%; overflow:hidden; text-overflow:ellipsis }
+.sect { font-size:10.5px; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:var(--faint); margin:12px 6px 3px; display:flex; gap:6px; align-items:center }
+.sect:first-child { margin-top:0 }
+.sect i { width:6px; height:6px; border-radius:50%; background:var(--ship) }
+
+/* ---- detail drawer ---- */
+.shade { position:fixed; inset:0; background:var(--shade); z-index:20; opacity:0; pointer-events:none; transition:opacity .15s }
+.shade.on { opacity:1; pointer-events:auto }
+aside { position:fixed; top:0; right:0; bottom:0; width:min(440px, 100%); background:var(--panel); border-left:1px solid var(--line);
+  z-index:21; transform:translateX(100%); transition:transform .18s ease; display:flex; flex-direction:column }
+aside.on { transform:none }
+.dhead { flex:none; display:flex; gap:8px; align-items:flex-start; padding:12px 14px 10px; border-bottom:1px solid var(--line) }
+.dhead .title { font-size:14px; -webkit-line-clamp:3 }
+.dhead .x { background:none; border:0; cursor:pointer; color:var(--mut); font-size:18px; line-height:1; padding:0 2px }
+.dbody { flex:1; overflow-y:auto; padding:4px 14px 16px }
+.dbody h4 { margin:12px 0 4px; font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--faint) }
+.dbody .txt { font-size:12.5px; overflow-wrap:anywhere }
+.dbody .why { color:var(--you); font-weight:600 }
+.prrow { font-size:12.5px; margin:3px 0 } .prrow a { color:var(--rev); text-decoration:none } .prrow a:hover { text-decoration:underline }
+.cmd { display:flex; gap:6px }
+.cmd code { flex:1; min-width:0; background:var(--soft); border-radius:6px; padding:4px 8px; overflow-x:auto; white-space:nowrap; font:11px var(--mono) }
+pre { white-space:pre-wrap; background:var(--soft); padding:8px 10px; border-radius:6px; margin:0; font:11px/1.5 var(--mono); max-height:200px; overflow:auto }
+.actions { display:flex; gap:5px; flex-wrap:wrap }
+
+.toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); background:var(--fg); color:var(--bg); padding:6px 12px;
+  border-radius:8px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:30; font-size:12px }
 .toast.on { opacity:1 }
-@media (max-width:640px) { header, main { padding-left:16px; padding-right:16px } }
+
+/* narrow window: stack the columns and let the page scroll */
+@media (max-width:720px) {
+  body { overflow:auto; height:auto; display:block }
+  .board { display:block !important }
+  .lane { margin-bottom:14px }
+  .scroll { overflow:visible }
+  #q { width:100px }
+}
 </style></head><body>
 <header>
-  <h1>Efforts</h1>
-  <div class="stats">%(stats)s</div>
-  <div class="grow"></div>
-  <input id="q" placeholder="filter…" oninput="filter()" size="16">
-  <label class="meta"><input type="checkbox" id="closed" %(closed_checked)s onchange="toggleClosed()"> closed</label>
-  <button onclick="sync(this)">Sync GitHub</button>
-  <span class="meta">synced %(synced)s</span>
+  <span class="brand" id="live" title="connecting…"><i></i>gj</span>
+  <span class="counts" id="counts"></span>
+  <span class="grow"></span>
+  <span class="tools">
+    <input id="q" placeholder="Filter  /" autocomplete="off">
+    <button class="btn" id="syncbtn" title="Pull PR state from GitHub">Sync</button>
+    <span id="synced"></span>
+  </span>
 </header>
-<main>%(body)s</main>
+<main class="board" id="board"></main>
+<div class="shade" id="shade"></div>
+<aside id="drawer" aria-hidden="true"></aside>
 <div class="toast" id="toast"></div>
 <script>
-function toast(t){const e=document.getElementById('toast');e.textContent=t;e.classList.add('on');
-  setTimeout(()=>e.classList.remove('on'),1400)}
-function copy(btn){const t=btn.previousElementSibling.textContent;
-  (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(()=>toast('Copied'),
-  ()=>{const r=document.createRange();r.selectNode(btn.previousElementSibling);
-  getSelection().removeAllRanges();getSelection().addRange(r);document.execCommand('copy');toast('Copied')})}
-async function post(path,body){const r=await fetch(path,{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
-  if(!r.ok) throw new Error(await r.text()); return r.json()}
-async function setStatus(id,s){await post('/api/status',{id,status:s});location.reload()}
-async function setNote(id,cur){const n=prompt('Note',cur);if(n===null)return;
-  await post('/api/note',{id,note:n});location.reload()}
-async function addPr(id){const u=prompt('PR url');if(!u)return;
-  try{await post('/api/pr',{id,url:u});location.reload()}catch(e){toast(e.message)}}
-async function sync(b){b.disabled=true;b.textContent='Syncing…';
-  try{const r=await post('/api/sync');toast('Synced '+r.synced+'/'+r.total);location.reload()}
-  catch(e){toast(e.message);b.disabled=false;b.textContent='Sync GitHub'}}
-function toggleClosed(){const u=new URL(location);
-  document.getElementById('closed').checked?u.searchParams.set('closed','1'):u.searchParams.delete('closed');
-  location=u}
-function filter(){const q=document.getElementById('q').value.toLowerCase();
-  document.querySelectorAll('.card').forEach(c=>c.style.display=
-    c.textContent.toLowerCase().includes(q)?'':'none')}
+const LANES = [
+  ['working', 'Working', 'No agent running'],
+  ['you', 'Needs you', 'Nothing waiting on you'],
+  ['review', 'In review', 'No open PRs'],
+];
+const STATUSES = ['active', 'review', 'blocked', 'done', 'dropped'];
+let data = null, lastOk = 0, openId = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function ago(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return 'now';
+  for (const [u, n] of [['d', 86400], ['h', 3600], ['m', 60]]) if (s >= n) return Math.floor(s / n) + u;
+}
+function toast(t) { const e = $('toast'); e.textContent = t; e.classList.add('on'); setTimeout(() => e.classList.remove('on'), 1500); }
+function where(e, full) {
+  let repo = e.repo || (e.cwd || '').split('/').pop();
+  if (!full) repo = repo.split('/').pop();
+  return [repo, e.branch].filter(Boolean).join(' · ');
+}
+function prChip(p) {
+  const bits = ['#' + p.number];
+  let cls = '';
+  if (p.state === 'MERGED') { bits.push('merged'); cls = 'merged'; }
+  else if (p.state === 'CLOSED') { bits.push('closed'); cls = 'bad'; }
+  else {
+    if (p.draft) bits.push('draft');
+    if (p.checks === 'fail') { bits.push('✕'); cls = 'bad'; }
+    else if (p.checks === 'pending') bits.push('…');
+    else if (p.checks === 'pass') bits.push('✓');
+    if (p.mergeable === 'CONFLICTING') { bits.push('conflict'); cls = 'bad'; }
+    if (p.review === 'CHANGES_REQUESTED') { bits.push('changes'); cls = 'bad'; }
+    else if (p.review === 'APPROVED') { bits.push('approved'); cls = cls || 'ok'; }
+  }
+  return `<a class="chip ${cls}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(p.title)}">${esc(bits.join(' '))}</a>`;
+}
+const openPrs = e => e.prs.filter(p => p.state === 'OPEN' || p.state === '');
+
+function card(e) {
+  const live = e.live || {};
+  let sub = '';
+  if (e.lane === 'working') sub = `<div class="sub"><i class="pulse"></i><span>${esc(live.doing || 'Working…')}</span></div>`;
+  else if (e.why) sub = `<div class="sub"><span>${esc(e.why)}</span></div>`;
+  return `<article class="card ${e.lane} ${openId === e.id ? 'sel' : ''}" data-id="${e.id}">
+    <div class="r1"><i class="ag ${esc(e.agent)}" title="${esc(e.agent)}"></i><span class="title">${esc(e.title)}</span><span class="age">${ago(e.last_activity)}</span></div>
+    ${sub}
+    <div class="meta"><span class="where" title="${esc(where(e, true))}">${esc(where(e))}</span>${openPrs(e).map(prChip).join('')}</div>
+  </article>`;
+}
+function row(e) {
+  const why = e.lane === 'shipped' ? (e.prs.length ? '#' + e.prs[e.prs.length - 1].number + (e.prs.length > 1 ? ' +' + (e.prs.length - 1) : '') : '') : (e.why || '');
+  return `<div class="row ${openId === e.id ? 'sel' : ''}" data-id="${e.id}" title="${esc(e.title)}">
+    <span class="t ${e.status}">${esc(e.title)}</span><span class="why">${esc(why)}</span><span class="age">${ago(e.lane === 'shipped' ? e.updated_at : e.last_activity)}</span></div>`;
+}
+
+function matches(e, q) {
+  if (!q) return true;
+  return [e.title, e.repo, e.branch, e.epic, e.agent, e.note, e.why, e.live.doing, e.prompt, ...e.prs.map(p => p.title + ' #' + p.number)]
+    .join(' ').toLowerCase().includes(q);
+}
+
+function render() {
+  if (!data) return;
+  const q = $('q').value.trim().toLowerCase();
+  const by = {working: [], you: [], review: [], idle: [], shipped: []};
+  for (const e of data.efforts) if (matches(e, q)) by[e.lane].push(e);
+  by.working.sort((a, b) => b.live.seen - a.live.seen);
+  for (const k of ['you', 'review', 'idle']) by[k].sort((a, b) => b.last_activity - a.last_activity);
+  by.shipped.sort((a, b) => b.updated_at - a.updated_at);
+  const done = by.shipped.filter(e => e.status === 'done').length;
+
+  $('counts').innerHTML = [['working', by.working.length, 'working'], ['you', by.you.length, 'need you'],
+    ['review', by.review.length, 'in review'], ['idle', by.idle.length, 'quiet'], ['shipped', done, 'shipped']]
+    .map(([k, n, l]) => `<span class="count ${k} ${n ? '' : 'zero'}"><b>${n}</b>${l}</span>`).join('');
+
+  // empty columns shrink so busy ones get the room
+  const cols = LANES.map(([k]) => by[k].length ? 'minmax(0,1fr)' : 'minmax(0,.45fr)');
+  $('board').style.gridTemplateColumns = cols.join(' ') + ' minmax(0,.85fr)';
+  const scrolls = [...document.querySelectorAll('.scroll')].map(s => s.scrollTop);
+
+  $('board').innerHTML = LANES.map(([k, title, empty]) => `<section class="lane ${k}"><h2><i></i>${title}<span class="n">${by[k].length}</span></h2>
+      <div class="scroll">${by[k].length ? by[k].map(card).join('') : `<div class="hint">${q ? 'No matches' : empty}</div>`}</div></section>`).join('') +
+    `<section class="lane rest"><h2><i></i>Quiet<span class="n">${by.idle.length}</span></h2><div class="scroll">
+      ${by.idle.map(row).join('') || `<div class="hint">${q ? 'No matches' : 'Nothing stalled'}</div>`}
+      ${by.shipped.length ? `<div class="sect"><i></i>Closed this week · ${by.shipped.length}</div>` + by.shipped.map(row).join('') : ''}
+    </div></section>`;
+  document.querySelectorAll('.scroll').forEach((s, i) => { s.scrollTop = scrolls[i] || 0; });
+
+  document.title = (by.you.length ? `(${by.you.length}) ` : '') + 'gj' + (by.working.length ? ` · ${by.working.length} working` : '');
+  $('synced').textContent = data.synced ? ago(data.synced) : 'never';
+  $('synced').title = 'GitHub last synced';
+  if (openId !== null) drawer();
+}
+
+function drawer() {
+  const e = data && data.efforts.find(x => x.id === openId);
+  if (!e) return closeDrawer();
+  const prs = e.prs.map(p => `<div class="prrow"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.repo)}#${p.number}</a> ${prChip(p)} ${esc(p.title)}</div>`).join('');
+  const live = e.live || {};
+  const keep = $('drawer').querySelector('.dbody');
+  const top = keep ? keep.scrollTop : 0;
+  $('drawer').innerHTML = `<div class="dhead"><i class="ag ${esc(e.agent)}" style="margin-top:6px"></i><span class="title">${esc(e.title)}</span><button class="x" data-act="close" title="Close (Esc)">×</button></div>
+    <div class="dbody">
+      ${e.why ? `<h4>Why it's here</h4><div class="txt why">${esc(e.why)}</div>` : ''}
+      ${live.doing ? `<h4>${e.lane === 'working' ? 'Doing now' : "Agent's last word"} · ${ago(live.seen)}</h4><div class="txt">${esc(live.doing)}</div>` : ''}
+      ${e.note ? `<h4>Note</h4><div class="txt">${esc(e.note)}</div>` : ''}
+      <h4>Where</h4><div class="txt" style="font:11.5px var(--mono)">${esc(where(e, true))}${e.epic ? ' · ' + esc(e.epic) : ''}</div>
+      <h4>Pull requests</h4>${prs || '<div class="txt" style="color:var(--faint)">None linked yet</div>'}
+      ${e.resume ? `<h4>Resume ${esc(e.agent)} session</h4><div class="cmd"><code>${esc(e.resume)}</code><button class="btn" data-act="copy">Copy</button></div>` : ''}
+      <h4>Request</h4><pre>${esc(e.prompt || '(not recorded)')}</pre>
+      <h4>Status: ${esc(e.status)} · started ${ago(e.created_at)} ago</h4>
+      <div class="actions">${STATUSES.filter(s => s !== e.status).map(s => `<button class="btn" data-act="status" data-v="${s}">${s}</button>`).join('')}
+        <button class="btn" data-act="note">note</button><button class="btn" data-act="pr">+ PR</button></div>
+    </div>`;
+  $('drawer').querySelector('.dbody').scrollTop = top;
+  $('drawer').classList.add('on'); $('shade').classList.add('on'); $('drawer').setAttribute('aria-hidden', 'false');
+}
+function openDrawer(id) { openId = id; $('drawer').innerHTML = ''; render(); }
+function closeDrawer() {
+  openId = null; $('drawer').classList.remove('on'); $('shade').classList.remove('on'); $('drawer').setAttribute('aria-hidden', 'true');
+  document.querySelectorAll('.sel').forEach(x => x.classList.remove('sel'));
+}
+
+function tick() {
+  const off = Date.now() - lastOk > 20000;
+  $('live').classList.toggle('off', off);
+  $('live').title = !lastOk ? 'connecting…' : off ? 'disconnected, retrying' : 'live, refreshes every 5s';
+}
+async function refresh() {
+  try {
+    const r = await fetch('/api/board', {cache: 'no-store'});
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json(); lastOk = Date.now(); render();
+  } catch (e) {}
+  tick();
+}
+async function post(path, body) {
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.json();
+}
+
+document.addEventListener('click', async ev => {
+  const btn = ev.target.closest('[data-act]');
+  if (btn) {
+    const act = btn.dataset.act;
+    if (act === 'close') return closeDrawer();
+    const id = openId, e = data.efforts.find(x => x.id === id);
+    try {
+      if (act === 'copy') { await navigator.clipboard.writeText(e.resume); toast('Copied'); return; }
+      if (act === 'status') await post('/api/status', {id, status: btn.dataset.v});
+      if (act === 'note') { const n = prompt('Note', e.note || ''); if (n === null) return; await post('/api/note', {id, note: n}); }
+      if (act === 'pr') { const u = prompt('PR url'); if (!u) return; await post('/api/pr', {id, url: u}); }
+      toast('Saved'); refresh();
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  if (ev.target.closest('a')) return;
+  const item = ev.target.closest('.card, .row');
+  if (item) { const id = +item.dataset.id; id === openId ? closeDrawer() : openDrawer(id); return; }
+  if (ev.target === $('shade')) closeDrawer();
+});
+$('syncbtn').addEventListener('click', async () => {
+  const b = $('syncbtn'); b.disabled = true; b.textContent = 'Syncing…';
+  try { const r = await post('/api/sync'); toast(`Synced ${r.synced}/${r.total} PRs`); await refresh(); }
+  catch (e) { toast(e.message); }
+  b.disabled = false; b.textContent = 'Sync';
+});
+$('q').addEventListener('input', render);
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement !== $('q')) { e.preventDefault(); $('q').focus(); }
+  if (e.key === 'Escape') {
+    if (openId !== null) closeDrawer();
+    else { $('q').value = ''; $('q').blur(); render(); }
+  }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+setInterval(() => { if (!document.hidden) refresh(); }, 5000);
+setInterval(tick, 1000);
+refresh();
 </script>
-</body></html>"""
-
-
-def e_(s):
-    return html.escape(str(s or ""), quote=True)
-
-
-def render_card(e):
-    closed = e["status"] in ("done", "dropped")
-    cls = "card" + (" hot" if e["flags"] else "") + (" closed" if closed else "")
-    prs = []
-    for p in e["prs"]:
-        bits = ['<span class="st %s">%s</span>' % (e_(p["state"]), e_(p["state"] or "unsynced"))]
-        if p["draft"]:
-            bits.append('<span class="st pending">draft</span>')
-        if p["state"] == "OPEN":
-            if p["checks"]:
-                bits.append('<span class="st %s">checks %s</span>' % (p["checks"], p["checks"]))
-            if p["review"] == "APPROVED":
-                bits.append('<span class="st pass">approved</span>')
-            elif p["review"] == "CHANGES_REQUESTED":
-                bits.append('<span class="st fail">changes requested</span>')
-            if p["mergeable"] == "CONFLICTING":
-                bits.append('<span class="st fail">conflict</span>')
-        prs.append('<div class="pr"><a href="%s" target="_blank">%s#%d</a> %s %s '
-                   '<span class="meta">updated %s ago</span></div>' % (
-                       e_(p["url"]), e_(p["repo"]), p["number"], e_(p["title"]),
-                       " ".join(bits), ago(p["pr_updated_at"])))
-    statuses = "".join(
-        '<button onclick="setStatus(%d,\'%s\')">%s</button>' % (e["id"], s, s)
-        for s in STATUSES if s != e["status"])
-    return """
-<div class="%(cls)s">
-  <div class="top">
-    <span class="id">#%(id)d</span><span class="title">%(title)s</span>
-    <span class="pill">%(status)s</span><span class="pill %(agent)s">%(agent)s</span>
-    <span class="meta">%(where)s · started %(created)s ago · active %(last)s ago</span>
-  </div>
-  %(flags)s
-  %(note)s
-  <div class="prs">%(prs)s</div>
-  %(cmd)s
-  <details><summary>initial prompt</summary><pre>%(prompt)s</pre></details>
-  <div class="actions">%(statuses)s
-    <button onclick="setNote(%(id)d, %(note_js)s)">note</button>
-    <button onclick="addPr(%(id)d)">+ PR</button></div>
-</div>""" % dict(
-        cls=cls, id=e["id"], title=e_(e["title"]), status=e_(e["status"]),
-        agent=e_(e["agent"] or "?"),
-        where=e_(" ".join(x for x in ((e["repo"] or os.path.basename(e["cwd"])), e["branch"]) if x)),
-        created=ago(e["created_at"]), last=ago(e["last_activity"]),
-        flags=('<div class="flags">%s</div>' % "".join(
-            '<span class="flag">%s</span>' % e_(f) for f in e["flags"])) if e["flags"] else "",
-        note=('<div class="note">📝 %s</div>' % e_(e["note"])) if e["note"] else "",
-        prs="".join(prs) or '<span class="meta">no PR linked yet</span>',
-        cmd=('<div class="cmd"><code>%s</code><button onclick="copy(this)">Copy</button></div>'
-             % e_(e["resume"])) if e["resume"] else "",
-        prompt=e_(e["prompt"] or "(not recorded)"), statuses=statuses,
-        note_js=e_(json.dumps(e["note"] or "")))
-
-
-def render(conn, include_closed):
-    efforts = load(conn, include_closed)
-    live = [e for e in efforts if e["status"] not in ("done", "dropped")]
-    open_prs = sum(1 for e in live for p in e["prs"] if p["state"] == "OPEN")
-    hot = sum(1 for e in live if e["flags"])
-    stats = "<span><b>%d</b> open efforts</span><span><b>%d</b> open PRs</span>" \
-            "<span><b>%d</b> need attention</span>" % (len(live), open_prs, hot)
-    groups = {}
-    for e in efforts:
-        groups.setdefault(e["epic"] or "", []).append(e)
-    body = []
-    for epic in sorted(groups, key=lambda k: (k == "", k.lower())):
-        if len(groups) > 1 or epic:
-            body.append('<div class="epic">%s</div>' % e_(epic or "No epic"))
-        body.extend(render_card(e) for e in groups[epic])
-    if not efforts:
-        body.append('<div class="empty">Nothing tracked yet. Agents register work with '
-                    '<code>gj start "title"</code>.</div>')
-    last = conn.execute("SELECT MAX(synced_at) FROM prs").fetchone()[0]
-    return PAGE % dict(stats=stats, body="".join(body), synced=ago(last) + " ago" if last else "never",
-                       closed_checked="checked" if include_closed else "")
+</body></html>
+"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -749,7 +1071,9 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(u.query)
         conn = db()
         if u.path == "/":
-            self.send(200, render(conn, "closed" in q), "text/html")
+            self.send(200, PAGE, "text/html")
+        elif u.path == "/api/board":
+            self.send(200, json.dumps(board(conn), default=str))
         elif u.path == "/api/efforts":
             self.send(200, json.dumps(load(conn, "closed" in q), default=str))
         else:
@@ -882,6 +1206,67 @@ def codex_sandbox(uninstall):
         print("gj: let codex sandbox write %s (%s)" % (DB_PATH.parent, cfg))
 
 
+# ---------------------------------------------------------------- service
+
+LABEL = "co.wetstone.gj"
+PLIST = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
+LOG_PATH = DB_PATH.parent / "serve.log"
+
+
+def service_plist(port, script=None, python=None, path=None):
+    """launchd agent that runs `gj serve` at login and restarts it if it dies."""
+    import plistlib
+    env = {"PATH": path or os.environ.get("PATH", "/usr/bin:/bin"), "GJ_DB": str(DB_PATH)}
+    return plistlib.dumps({
+        "Label": LABEL,
+        "ProgramArguments": [python or sys.executable,
+                             str(script or Path(__file__).resolve()),
+                             "serve", "--port", str(port)],
+        "EnvironmentVariables": env,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": str(LOG_PATH),
+        "StandardErrorPath": str(LOG_PATH),
+    })
+
+
+def cmd_service(args):
+    if sys.platform != "darwin":
+        sys.exit("gj: `gj service` uses launchd (macOS only); run `gj serve` under your "
+                 "own supervisor elsewhere")
+    domain = "gui/%d" % os.getuid()
+    url = "http://gj.localhost:%d/" % args.port
+    if args.action in ("install", "uninstall") and PLIST.exists():
+        run(["launchctl", "bootout", domain + "/" + LABEL])
+        if args.action == "uninstall":
+            PLIST.unlink()
+            print("gj: service removed")
+            return
+    if args.action == "install":
+        PLIST.parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PLIST.write_bytes(service_plist(args.port))
+        if run(["launchctl", "bootstrap", domain, str(PLIST)]) is None:
+            sys.exit("gj: launchctl bootstrap failed; is port %d already in use?" % args.port)
+        print("gj: service installed (%s)\ngj: dashboard at %s  (logs: %s)"
+              % (PLIST, url, LOG_PATH))
+        if args.open:
+            time.sleep(1)
+            run(["open", url])
+    elif args.action == "status":
+        out = run(["launchctl", "print", domain + "/" + LABEL])
+        if out is None:
+            print("gj: service not running (install with `gj service install`)")
+        else:
+            state = re.search(r"^\s*state = (.*)$", out, re.M)
+            pid = re.search(r"^\s*pid = (\d+)", out, re.M)
+            print("gj: service %s%s  %s" % (state.group(1) if state else "loaded",
+                                            " (pid %s)" % pid.group(1) if pid else "", url))
+    elif args.action == "uninstall":
+        print("gj: service not installed")
+
+
 # ---------------------------------------------------------------- cli
 
 def main(argv=None):
@@ -946,6 +1331,12 @@ def main(argv=None):
     p.add_argument("--no-sync", action="store_true")
     p.add_argument("--open", action="store_true", help="open in browser")
     p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("service", help="keep the dashboard running in the background (launchd)")
+    p.add_argument("action", choices=["install", "uninstall", "status"])
+    p.add_argument("--port", type=int, default=int(os.environ.get("GJ_PORT", "7777")))
+    p.add_argument("--open", action="store_true", help="open in browser after install")
+    p.set_defaults(fn=cmd_service)
 
     p = sub.add_parser("install", help="add gj instructions to agents' global instruction files")
     p.add_argument("agents", nargs="*", help="subset of: " + ", ".join(AGENTS))

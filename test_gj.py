@@ -87,6 +87,58 @@ class Misc(unittest.TestCase):
         gj.cmd_install(args)
         self.assertEqual(f.read_text(), "# mine\n")
 
+    def test_service_plist(self):
+        import plistlib
+        p = plistlib.loads(gj.service_plist(8080, script="/x/gj", python="/usr/bin/python3",
+                                            path="/opt/homebrew/bin:/usr/bin"))
+        self.assertEqual(p["ProgramArguments"],
+                         ["/usr/bin/python3", "/x/gj", "serve", "--port", "8080"])
+        self.assertTrue(p["RunAtLoad"] and p["KeepAlive"])
+        self.assertEqual(p["EnvironmentVariables"]["PATH"], "/opt/homebrew/bin:/usr/bin")
+        self.assertEqual(p["EnvironmentVariables"]["GJ_DB"], str(gj.DB_PATH))
+
+
+class Live(unittest.TestCase):
+    def test_claude_turn(self):
+        tool = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"description": "Run tests"}}]}}
+        result = {"type": "user", "message": {"content": [{"type": "tool_result"}]}}
+        final = {"type": "assistant", "message": {"content": [{"type": "text", "text": "All done."}]}}
+        self.assertEqual(gj.claude_turn([tool]), (False, "Bash: Run tests"))
+        self.assertEqual(gj.claude_turn([tool, result]), (False, "Bash: Run tests"))
+        self.assertEqual(gj.claude_turn([tool, result, final]), (True, "All done."))
+
+    def test_codex_turn(self):
+        msg = {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                                   "content": [{"text": "Looks good."}]}}
+        ev = lambda t: {"type": "event_msg", "payload": {"type": t}}
+        self.assertEqual(gj.codex_turn([ev("task_started"), msg]), (False, "Looks good."))
+        self.assertEqual(gj.codex_turn([msg, ev("task_complete")]), (True, "Looks good."))
+
+    def test_grok_turn(self):
+        call = {"type": "assistant", "content": "", "tool_calls": [{"name": "grep"}]}
+        self.assertEqual(gj.grok_turn([call]), (False, "grep"))
+        self.assertEqual(gj.grok_turn([call, {"type": "assistant", "content": "Fixed."}]),
+                         (True, "Fixed."))
+
+    def test_lanes(self):
+        t = time.time()
+        live = lambda s, seen=t: {"state": s, "seen": seen, "doing": ""}
+        e = lambda **kw: dict(effort(status="active", note="", **kw), flags=gj.flags(effort(**kw)))
+        self.assertEqual(gj.lane(dict(e(), live=live("working")))[0], "working")
+        self.assertEqual(gj.lane(dict(e(), live=live("done")))[0], "you")
+        self.assertEqual(gj.lane(dict(e(), live=live("stalled", t - 600)))[0], "you")
+        self.assertEqual(gj.lane(dict(e(prs=[pr()]), live=live("done")))[0], "review")
+        self.assertEqual(gj.lane(dict(e(prs=[pr(checks="fail")]), live=live("done"))),
+                         ("you", "#7 checks failing"))
+        stale = pr(pr_updated_at=t - 10 * 86400)
+        old = t - 9 * 86400
+        self.assertEqual(gj.lane(dict(e(prs=[stale], updated_at=old),
+                                      live=live("done", old)))[0], "idle")
+        # a fresh PR next to a stale one keeps the effort in review
+        self.assertEqual(gj.lane(dict(e(prs=[stale, pr(number=8)], updated_at=old),
+                                      live=live("done", old))), ("review", "#7 stale 10d"))
+
 
 if __name__ == "__main__":
     unittest.main()

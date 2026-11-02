@@ -9,8 +9,14 @@ dashboard served on localhost.
 ```sh
 ./install.sh          # symlinks gj into ~/.local/bin
 gj install            # tells Claude, Codex, and Grok to use gj (idempotent)
-gj serve --open       # dashboard at http://127.0.0.1:7777
+gj service install    # dashboard always on at http://gj.localhost:7777
 ```
+
+`gj service install` registers a macOS LaunchAgent (`~/Library/LaunchAgents/co.wetstone.gj.plist`)
+that runs `gj serve` at login and restarts it if it exits. It captures your current `PATH`
+so the service can find `gh`. Logs go to `~/.local/share/gj/serve.log`. Use
+`gj service status` to check on it and `gj service uninstall` to remove it. To run the
+dashboard in the foreground instead, use `gj serve --open`.
 
 `gj install` adds a short marked block to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and
 `~/.grok/AGENTS.md`. For Codex it also adds the gj data directory to
@@ -65,6 +71,7 @@ gj status active|review|blocked|done|dropped [--note ..] [--id N]
 gj note text... [--id N]          gj edit --id N [--title|--epic|--prompt]
 gj ls [-a] [-s] [--json]          gj resume N          gj rm N
 gj sync [--all]                   gj serve [--port 7777] [--open]
+gj service install|uninstall|status [--port 7777] [--open]
 ```
 
 Commands with no `--id` act on the effort registered by the calling agent session.
