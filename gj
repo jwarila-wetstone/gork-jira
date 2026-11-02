@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS prs (
     review         TEXT NOT NULL DEFAULT '',   -- APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
     checks         TEXT NOT NULL DEFAULT '',   -- pass / fail / pending / ''
     mergeable      TEXT NOT NULL DEFAULT '',   -- MERGEABLE / CONFLICTING / UNKNOWN
+    auto_merge     TEXT NOT NULL DEFAULT '',   -- merge method when auto-merge is on, else ''
     pr_updated_at  REAL NOT NULL DEFAULT 0,
     synced_at      REAL NOT NULL DEFAULT 0
 );
@@ -75,6 +76,9 @@ def db():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(prs)")}
+    if "auto_merge" not in cols:
+        conn.execute("ALTER TABLE prs ADD COLUMN auto_merge TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -369,7 +373,8 @@ def cmd_rm(args):
 
 # ---------------------------------------------------------------- github sync
 
-GH_FIELDS = "number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,updatedAt"
+GH_FIELDS = ("number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,updatedAt,"
+             "autoMergeRequest")
 
 
 def rollup(checks):
@@ -403,9 +408,10 @@ def sync_prs(conn, urls):
         ok += 1
         conn.execute(
             "UPDATE prs SET title=?, state=?, draft=?, review=?, checks=?, mergeable=?, "
-            "pr_updated_at=?, synced_at=? WHERE url=?",
+            "auto_merge=?, pr_updated_at=?, synced_at=? WHERE url=?",
             (d["title"], d["state"], int(d["isDraft"]), d.get("reviewDecision") or "",
              rollup(d.get("statusCheckRollup")), d.get("mergeable") or "",
+             (d.get("autoMergeRequest") or {}).get("mergeMethod") or "",
              parse_ts(d.get("updatedAt")), now(), url))
     conn.commit()
     return ok, len(urls)
@@ -508,7 +514,8 @@ def flags(e):
             out.append(tag + "merge conflict")
         if p["review"] == "CHANGES_REQUESTED":
             out.append(tag + "changes requested")
-        if p["review"] == "APPROVED" and p["checks"] != "fail" and not p["draft"]:
+        if (p["review"] == "APPROVED" and p["checks"] != "fail" and not p["draft"]
+                and not p.get("auto_merge")):
             out.append(tag + "approved - merge it")
         if p["pr_updated_at"] and now() - p["pr_updated_at"] > STALE_DAYS * 86400:
             out.append(tag + "stale %s" % ago(p["pr_updated_at"]))
@@ -691,6 +698,11 @@ def lane(e):
     open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
     if live.get("state") == "working":
         return "working", ""
+    if open_prs and all(p.get("auto_merge") for p in open_prs):
+        # You turned on auto-merge, so it's handed off (even if an agent left it 'blocked');
+        # GitHub merges it when it can, and any problem still shows on the card.
+        problems = [f for f in e["flags"] if f != "blocked"]
+        return "review", problems[0] if problems else "auto-merge on"
     if e["status"] == "blocked":
         return "you", e["note"] or "blocked"
     urgent = [f for f in e["flags"] if " stale " not in " %s " % f and "idle" not in f]
@@ -902,6 +914,7 @@ function prChip(p) {
     if (p.mergeable === 'CONFLICTING') { bits.push('conflict'); cls = 'bad'; }
     if (p.review === 'CHANGES_REQUESTED') { bits.push('changes'); cls = 'bad'; }
     else if (p.review === 'APPROVED') { bits.push('approved'); cls = cls || 'ok'; }
+    if (p.auto_merge) { bits.push('auto-merge'); cls = cls || 'ok'; }
   }
   return `<a class="chip ${cls}" href="${esc(p.url)}" target="_blank" rel="noopener" title="${esc(p.title)}">${esc(bits.join(' '))}</a>`;
 }

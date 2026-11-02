@@ -135,6 +135,17 @@ class Live(unittest.TestCase):
         old = t - 9 * 86400
         self.assertEqual(gj.lane(dict(e(prs=[stale], updated_at=old),
                                       live=live("done", old)))[0], "idle")
+        # auto-merge: GitHub will merge it, so it never lands in Needs you
+        am = pr(review="APPROVED", auto_merge="SQUASH")
+        self.assertEqual(gj.flags(effort(prs=[am])), [])
+        self.assertEqual(gj.lane(dict(e(prs=[am]), live=live("done"))), ("review", "auto-merge on"))
+        bad = pr(checks="fail", auto_merge="SQUASH")
+        self.assertEqual(gj.lane(dict(e(prs=[bad]), live=live("done"))),
+                         ("review", "#7 checks failing"))
+        blocked = dict(e(prs=[am]), status="blocked", note="waiting on go", live=live("done"))
+        self.assertEqual(gj.lane(blocked), ("review", "auto-merge on"))
+        mixed = [am, pr(number=8, checks="fail")]
+        self.assertEqual(gj.lane(dict(e(prs=mixed), live=live("done")))[0], "you")
         # a fresh PR next to a stale one keeps the effort in review
         self.assertEqual(gj.lane(dict(e(prs=[stale, pr(number=8)], updated_at=old),
                                       live=live("done", old))), ("review", "#7 stale 10d"))
