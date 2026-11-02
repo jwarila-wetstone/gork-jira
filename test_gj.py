@@ -73,6 +73,15 @@ class Misc(unittest.TestCase):
         self.assertEqual(gj.auto_close(conn), [])
         conn.execute("UPDATE prs SET state = 'CLOSED' WHERE number = 2")
         self.assertEqual(gj.auto_close(conn), [(eid, "done")])
+        # blocked before the merge: the merge resolved it; blocked after: follow-up work, keep
+        conn.execute("UPDATE efforts SET status = 'blocked', updated_at = 100 WHERE id = ?", (eid,))
+        conn.execute("UPDATE prs SET pr_updated_at = 200 WHERE effort_id = ?", (eid,))
+        self.assertEqual(gj.auto_close(conn), [(eid, "done")])
+        conn.execute("UPDATE efforts SET status = 'blocked', updated_at = 300 WHERE id = ?", (eid,))
+        self.assertEqual(gj.auto_close(conn), [])
+        conn.execute("UPDATE efforts SET updated_at = 100 WHERE id = ?", (eid,))
+        conn.execute("UPDATE prs SET state = 'CLOSED' WHERE effort_id = ?", (eid,))
+        self.assertEqual(gj.auto_close(conn), [])   # blocked + closed unmerged: not dropped
 
     def test_install_idempotent(self):
         d = Path(tempfile.mkdtemp())
@@ -152,6 +161,36 @@ class Live(unittest.TestCase):
         # a fresh PR next to a stale one keeps the effort in review
         self.assertEqual(gj.lane(dict(e(prs=[stale, pr(number=8)], updated_at=old),
                                       live=live("done", old))), ("review", "#7 stale 10d"))
+
+
+class Stages(unittest.TestCase):
+    def test_stage_from_github(self):
+        self.assertEqual(gj.stage_of(effort(stage="verify")), "verify")
+        self.assertEqual(gj.stage_of(effort(stage="")), "")
+        self.assertEqual(gj.stage_of(effort(stage="review", prs=[pr()])), "codex")
+        self.assertEqual(gj.stage_of(effort(stage="human", prs=[pr()])), "human")
+        self.assertEqual(gj.stage_of(effort(stage="build", prs=[pr(state="CLOSED")])), "build")
+        self.assertEqual(gj.stage_of(effort(stage="codex", prs=[pr(review="APPROVED")])), "merge")
+        self.assertEqual(gj.stage_of(effort(stage="build", prs=[pr(state="MERGED")])), "merge")
+
+    def test_stage_lanes(self):
+        t = time.time()
+        done = {"state": "done", "seen": t, "doing": ""}
+        e = dict(effort(status="active", note="", stage="plan"), flags=[], live=done)
+        self.assertEqual(gj.lane(e), ("you", "plan ready for your review"))
+        e = dict(effort(status="active", note="", stage="human", prs=[pr()]), flags=[], live=done)
+        self.assertEqual(gj.lane(e), ("you", "Codex review done, ready for your approval"))
+        e["stage"] = "codex"
+        self.assertEqual(gj.lane(e)[0], "review")
+
+    def test_stage_cmd(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, status, stage, created_at, updated_at) "
+                           "VALUES ('x', 'blocked', 'plan', 0, 0)").lastrowid
+        conn.commit()
+        gj.cmd_stage(type("A", (), {"id": eid, "stage": "review", "note": "e2e green"}))
+        row = gj.db().execute("SELECT * FROM efforts WHERE id = ?", (eid,)).fetchone()
+        self.assertEqual((row["stage"], row["note"], row["status"]), ("review", "e2e green", "active"))
 
 
 if __name__ == "__main__":

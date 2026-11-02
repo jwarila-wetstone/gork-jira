@@ -30,6 +30,9 @@ STALE_DAYS = float(os.environ.get("GJ_STALE_DAYS", "3"))
 AGENTS = ("claude", "codex", "grok")
 STATUSES = ("active", "review", "blocked", "done", "dropped")
 OPEN_STATUSES = ("active", "review", "blocked")
+# The path every effort follows. Agents report plan..review with `gj stage`;
+# pr, codex, human and merge also follow from GitHub state.
+STAGES = ("plan", "build", "verify", "review", "pr", "codex", "human", "merge")
 PR_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 SCHEMA = """
@@ -45,6 +48,7 @@ CREATE TABLE IF NOT EXISTS efforts (
     cwd         TEXT NOT NULL DEFAULT '',
     repo        TEXT NOT NULL DEFAULT '',
     branch      TEXT NOT NULL DEFAULT '',
+    stage       TEXT NOT NULL DEFAULT '',
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
@@ -79,6 +83,8 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(prs)")}
     if "auto_merge" not in cols:
         conn.execute("ALTER TABLE prs ADD COLUMN auto_merge TEXT NOT NULL DEFAULT ''")
+    if "stage" not in {r[1] for r in conn.execute("PRAGMA table_info(efforts)")}:
+        conn.execute("ALTER TABLE efforts ADD COLUMN stage TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -311,9 +317,9 @@ def cmd_start(args):
     else:
         t = now()
         eid = conn.execute(
-            "INSERT INTO efforts(title, prompt, epic, agent, session_id, cwd, repo, branch, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, t, t)).lastrowid
+            "INSERT INTO efforts(title, prompt, epic, agent, session_id, cwd, repo, branch, stage, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, "plan", t, t)).lastrowid
         verb = "started"
     for url in args.pr or []:
         add_pr(conn, eid, url)
@@ -344,6 +350,38 @@ def cmd_status(args):
     touch(conn, e["id"], **fields)
     conn.commit()
     print("gj: #%d -> %s" % (e["id"], args.status))
+
+
+def cmd_stage(args):
+    conn = db()
+    e = current_effort(conn, args)
+    fields = {"stage": args.stage}
+    if args.note is not None:
+        fields["note"] = args.note
+    if e["status"] == "blocked":
+        fields["status"] = "active"
+    touch(conn, e["id"], **fields)
+    conn.commit()
+    print("gj: #%d stage -> %s" % (e["id"], args.stage))
+
+
+def stage_of(e):
+    """The furthest stage the effort has reached: the agent's report, or GitHub's if further."""
+    s = e.get("stage") or ""
+    rank = STAGES.index(s) if s in STAGES else -1
+
+    def reach(x):
+        nonlocal s, rank
+        if STAGES.index(x) > rank:
+            s, rank = x, STAGES.index(x)
+    open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
+    if any(p["state"] != "CLOSED" for p in e["prs"]):   # a PR closed unmerged doesn't count
+        reach("codex")
+    if open_prs and all(p["review"] == "APPROVED" for p in open_prs):
+        reach("merge")
+    if e["prs"] and not open_prs and any(p["state"] == "MERGED" for p in e["prs"]):
+        reach("merge")
+    return s
 
 
 def cmd_note(args):
@@ -443,13 +481,19 @@ def discover_prs(conn):
 
 
 def auto_close(conn):
-    """Efforts whose PRs are all merged/closed are done."""
+    """Efforts whose PRs are all merged/closed are done.
+
+    A blocked effort closes too when its last PR closed after it was blocked: the block was
+    about getting the PR out. A block set after the merge (follow-up work) stays open."""
     rows = conn.execute(
-        "SELECT e.id, SUM(p.state = 'MERGED') merged, SUM(p.state IN ('MERGED','CLOSED')) shut, "
-        "COUNT(*) n FROM efforts e JOIN prs p ON p.effort_id = e.id "
-        "WHERE e.status IN ('active','review') GROUP BY e.id").fetchall()
+        "SELECT e.id, e.status, e.updated_at, SUM(p.state = 'MERGED') merged, "
+        "SUM(p.state IN ('MERGED','CLOSED')) shut, COUNT(*) n, MAX(p.pr_updated_at) last_pr "
+        "FROM efforts e JOIN prs p ON p.effort_id = e.id "
+        "WHERE e.status IN ('active','review','blocked') GROUP BY e.id").fetchall()
     closed = []
     for r in rows:
+        if r["status"] == "blocked" and (not r["merged"] or (r["last_pr"] or 0) <= r["updated_at"]):
+            continue   # never auto-drop a blocked effort; its PR may come back in another form
         if r["n"] and r["shut"] == r["n"]:
             status = "done" if r["merged"] else "dropped"
             touch(conn, r["id"], status=status)
@@ -493,6 +537,7 @@ def load(conn, include_closed=False):
         e["prs"] = prs.get(e["id"], [])
         e["resume"] = resume_cmd(e)
         e["flags"] = flags(e)
+        e["stage_set"], e["stage"] = e["stage"], stage_of(e)
         last = max([e["updated_at"]] + [p["pr_updated_at"] for p in e["prs"]])
         e["last_activity"] = last
     efforts.sort(key=lambda e: (e["status"] in ("done", "dropped"), -len(e["flags"]),
@@ -539,8 +584,8 @@ def cmd_ls(args):
         return
     for e in efforts:
         prs = " ".join("#%d:%s" % (p["number"], (p["state"] or "?").lower()) for p in e["prs"])
-        print("#%-4d %-7s %-6s %-5s %s%s" % (
-            e["id"], e["status"], e["agent"] or "?", ago(e["last_activity"]),
+        print("#%-4d %-7s %-6s %-6s %-5s %s%s" % (
+            e["id"], e["status"], e["stage"] or "-", e["agent"] or "?", ago(e["last_activity"]),
             ("[%s] " % e["epic"]) if e["epic"] else "", e["title"]))
         if prs:
             print("      prs: %s" % prs)
@@ -710,6 +755,8 @@ def lane(e):
         return "you", e["note"] or "blocked"
     if live.get("state") == "stalled" and now() - live["seen"] < 86400:
         return "you", "agent stopped mid-task (approval prompt or crash?)"
+    if e.get("stage") == "human" and open_prs:
+        return "you", "Codex review done, ready for your approval"
     last = max(e["updated_at"], live.get("seen") or 0,
                *[p["pr_updated_at"] for p in open_prs])
     quiet = now() - last > STALE_DAYS * 86400
@@ -717,6 +764,8 @@ def lane(e):
     if open_prs and not quiet:
         return "review", why
     if not open_prs and live.get("state") == "done" and now() - live["seen"] < 86400:
+        if e.get("stage") == "plan":
+            return "you", "plan ready for your review"
         return "you", "agent finished its turn and is waiting on you"
     return "idle", why
 
@@ -819,6 +868,15 @@ a.chip:hover { text-decoration:underline }
 .chip.ok { background:var(--worksoft); color:var(--work) }
 .chip.bad { background:var(--badsoft); color:var(--bad) }
 .chip.merged { background:var(--shipsoft); color:var(--ship) }
+.stg { display:inline-flex; gap:2px; align-items:center; margin-right:5px; flex:none }
+.stg i { width:7px; height:4px; border-radius:1px; background:var(--line) }
+.stg i.d { background:var(--faint) } .stg i.c { background:var(--fg) }
+.card.working .stg i.c { background:var(--work) } .card.you .stg i.c { background:var(--you) }
+.card.review .stg i.c { background:var(--rev) }
+.stg em { font-style:normal; font-size:10.5px; color:var(--mut); margin-left:4px }
+.path { display:flex; flex-wrap:wrap; gap:3px 0; font-size:12px; color:var(--faint) }
+.path span + span::before { content:"›"; margin:0 5px; color:var(--line) }
+.path .d { color:var(--mut) } .path .c { color:var(--fg); font-weight:650 }
 .ag { flex:none; width:6px; height:6px; border-radius:50%; background:var(--faint); align-self:center }
 .ag.claude { background:#d97757 } .ag.codex { background:#10a37f } .ag.grok { background:var(--fg) }
 
@@ -885,6 +943,19 @@ const LANES = [
   ['review', 'In review', 'No open PRs'],
 ];
 const STATUSES = ['active', 'review', 'blocked', 'done', 'dropped'];
+const STAGES = ['plan', 'build', 'verify', 'review', 'pr', 'codex', 'human', 'merge'];
+const STAGE_NAMES = {plan: 'Plan', build: 'Build', verify: 'Verify', review: 'Self-review', pr: 'PR',
+  codex: 'Codex review', human: 'Human approval', merge: 'Merge'};
+function strip(e) {
+  const i = STAGES.indexOf(e.stage);
+  if (i < 0) return '';
+  return `<span class="stg" title="Stage ${i + 1} of ${STAGES.length}: ${STAGE_NAMES[e.stage]}">` +
+    STAGES.map((s, j) => `<i class="${j < i ? 'd' : j === i ? 'c' : ''}"></i>`).join('') + `<em>${esc(e.stage)}</em></span>`;
+}
+function path(e) {
+  const i = STAGES.indexOf(e.stage);
+  return `<div class="path">${STAGES.map((s, j) => `<span class="${j < i ? 'd' : j === i ? 'c' : ''}">${j < i ? '✓ ' : ''}${STAGE_NAMES[s]}</span>`).join('')}</div>`;
+}
 let data = null, lastOk = 0, openId = null;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -928,7 +999,7 @@ function card(e) {
   return `<article class="card ${e.lane} ${openId === e.id ? 'sel' : ''}" data-id="${e.id}">
     <div class="r1"><i class="ag ${esc(e.agent)}" title="${esc(e.agent)}"></i><span class="title">${esc(e.title)}</span><span class="age">${ago(e.last_activity)}</span></div>
     ${sub}
-    <div class="meta"><span class="where" title="${esc(where(e, true))}">${esc(where(e))}</span>${openPrs(e).map(prChip).join('')}</div>
+    <div class="meta">${strip(e)}<span class="where" title="${esc(where(e, true))}">${esc(where(e))}</span>${openPrs(e).map(prChip).join('')}</div>
   </article>`;
 }
 function row(e) {
@@ -939,7 +1010,7 @@ function row(e) {
 
 function matches(e, q) {
   if (!q) return true;
-  return [e.title, e.repo, e.branch, e.epic, e.agent, e.note, e.why, e.live.doing, e.prompt, ...e.prs.map(p => p.title + ' #' + p.number)]
+  return [e.title, e.repo, e.branch, e.epic, e.agent, e.stage, e.note, e.why, e.live.doing, e.prompt, ...e.prs.map(p => p.title + ' #' + p.number)]
     .join(' ').toLowerCase().includes(q);
 }
 
@@ -988,6 +1059,7 @@ function drawer() {
       ${e.why ? `<h4>Why it's here</h4><div class="txt why">${esc(e.why)}</div>` : ''}
       ${live.doing ? `<h4>${e.lane === 'working' ? 'Doing now' : "Agent's last word"} · ${ago(live.seen)}</h4><div class="txt">${esc(live.doing)}</div>` : ''}
       ${e.note ? `<h4>Note</h4><div class="txt">${esc(e.note)}</div>` : ''}
+      ${STAGES.includes(e.stage) ? `<h4>Stage</h4>${path(e)}` : ''}
       <h4>Where</h4><div class="txt" style="font:11.5px var(--mono)">${esc(where(e, true))}${e.epic ? ' · ' + esc(e.epic) : ''}</div>
       <h4>Pull requests</h4>${prs || '<div class="txt" style="color:var(--faint)">None linked yet</div>'}
       ${e.resume ? `<h4>Resume ${esc(e.agent)} session</h4><div class="cmd"><code>${esc(e.resume)}</code><button class="btn" data-act="copy">Copy</button></div>` : ''}
@@ -1153,16 +1225,35 @@ def cmd_serve(args):
 MARK_BEGIN = "<!-- gj:begin -->"
 MARK_END = "<!-- gj:end -->"
 INSTRUCTIONS = MARK_BEGIN + """
-## Effort tracking (gj)
+## Effort tracking and workflow (gj)
 
-The user tracks every line of work that leads to a PR with the `gj` CLI, so no PR is forgotten.
-When a task will produce a pull request, do this without being asked:
+The user tracks every line of work that leads to a PR with the `gj` CLI, so no PR is forgotten,
+and moves each one through the same stages. When a task will produce a pull request, do this
+without being asked:
 
 1. Before you start, register it: `gj start "<short title>" --prompt "<the user's request, verbatim>"`
    (add `--epic "<name>"` if the user names a larger effort). Run it from the repo or worktree you work in.
-   Run it once per session; running it again only updates the title.
-2. Right after you open a PR: `gj pr <pr-url>`
-3. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
+   Run it once per session; running it again only updates the title. New work starts at the `plan` stage.
+2. Report each stage as you enter it with `gj stage <stage>`:
+
+   | Stage | What you do | Move on when |
+   |---|---|---|
+   | `plan` | Ask the questions whose answers change the design. Then propose a plan: the change, its risks, and **how you will verify it** (which tests, E2E run, or environment rehearsal). Keep it to a few lines for a small change. Stop and wait. | The user approves it. If the request already settles the approach, say so and go on. |
+   | `build` | Implement the plan. | It is built. |
+   | `verify` | Run the verification the plan named, in the most realistic environment it calls for. | It passes: `gj stage review --note "<what you ran, where, and the result>"`. If it fails, go back to `build`. |
+   | `review` | Review your own diff once (`/code-review` in Claude Code) and fix what is real. One pass. | Open the PR, then run `gj pr <url>`. |
+   | `codex` | The Codex review loop below. | `gj stage human` |
+   | `human`, `merge` | Nothing. gj follows approval and merge on GitHub. | |
+
+3. **Codex review loop.** Codex reviews the PR on GitHub when it opens. Each round:
+   - Read its review comments with `gh`. Fix the real findings and re-run the verification the fix touches.
+     Reply on the thread to any finding you disagree with, saying why.
+   - Push, then comment `@codex review` on the PR to request the next round.
+   - Do not sleep or poll for the review. End your turn and tell the user what you pushed; the user tells
+     you when the next review is in.
+   - Stop after 3 rounds, or sooner when nothing Codex raises is a real problem. Then run `gj stage human`
+     and summarize what is still open for the human reviewer.
+4. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
    When the work is finished without a PR: `gj status done`.
 
 `gj` detects the agent and session on its own. If a `gj` command fails, mention it once and keep working.
@@ -1307,6 +1398,12 @@ def main(argv=None):
     p.add_argument("--note")
     p.add_argument("--id", type=int)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("stage", help="report the stage: " + " > ".join(STAGES))
+    p.add_argument("stage", choices=STAGES)
+    p.add_argument("--note", help="e.g. the verification evidence")
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_stage)
 
     p = sub.add_parser("note", help="set the effort's note")
     p.add_argument("text", nargs="+")
