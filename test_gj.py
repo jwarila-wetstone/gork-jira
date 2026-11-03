@@ -254,5 +254,59 @@ class Stages(unittest.TestCase):
         self.assertEqual(gj.auto_close(conn), [])   # already done; nothing left to close
 
 
+
+class Summaries(unittest.TestCase):
+    def setUp(self):
+        gj.DB_PATH = Path(tempfile.mkdtemp()) / "gj.db"
+
+    def test_span(self):
+        from datetime import datetime
+        mon = datetime(2026, 11, 2, 9, 30).timestamp()
+        start, end, label = gj.summary_span("daily", mon)
+        self.assertEqual((datetime.fromtimestamp(start), datetime.fromtimestamp(end)),
+                         (datetime(2026, 10, 30), datetime(2026, 11, 2)))
+        self.assertEqual(label, "Fri Oct 30 through Sun Nov 1")
+        start, end, label = gj.summary_span("daily", datetime(2026, 11, 4, 8).timestamp())
+        self.assertEqual((datetime.fromtimestamp(start), label), (datetime(2026, 11, 3), "Tue Nov 3"))
+        start, end, _ = gj.summary_span("weekly", mon)
+        self.assertEqual((end - start, end), (7 * 86400, mon))
+
+    def test_digest(self):
+        t = time.time()
+        shipped = effort(id=1, title="Shipped thing", status="done", updated_at=t - 50, lane="shipped",
+                         prs=[pr(number=7, state="MERGED", closed_at=t - 60)])
+        old = effort(id=2, title="Long ago", status="done", updated_at=t - 9e5, lane="shipped",
+                     prs=[pr(number=8, state="MERGED", closed_at=t - 9e5)])
+        waiting = effort(id=3, title="Needs a look", lane="you", why="plan ready", updated_at=t - 99,
+                         prs=[pr(number=9, state="MERGED", closed_at=t - 9e5), pr(number=10)])
+        quiet = effort(id=4, title="Sleepy", lane="idle", updated_at=t - 9e5, created_at=t - 9e5)
+        for e in (shipped, old, waiting, quiet):
+            e.update(epic="", prompt="", note="", created_at=e.get("created_at", t - 9e5))
+            for p in e["prs"]:
+                p.update(repo="a/b", title="t", url="u")
+        d = gj.summary_digest(None, t - 1000, t, [shipped, old, waiting, quiet])
+        done, rest = d.split("# Still open now")
+        self.assertIn("Shipped thing", done)
+        self.assertIn("merged in window", done)
+        self.assertNotIn("Long ago", d)
+        self.assertIn("Needs a look", rest)
+        self.assertIn("1 earlier PRs", rest)
+        self.assertNotIn("#9 ", rest)
+        self.assertIn("# Quiet", rest)
+        self.assertIn("#4 Sleepy", rest)
+
+    def test_daily_once(self):
+        conn = gj.db()
+        calls = []
+        ask = lambda system, text: calls.append(system) or "## Executive summary\nhi"
+        a = gj.make_summary(conn, "daily", ask)
+        b = gj.make_summary(conn, "daily", ask)
+        self.assertEqual((len(calls), a["text"], b["text"]), (1, "## Executive summary\nhi", a["text"]))
+        gj.make_summary(conn, "weekly", ask)
+        gj.make_summary(conn, "weekly", ask)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(gj.latest_summary(conn, "weekly")["text"], a["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

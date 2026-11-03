@@ -61,6 +61,12 @@ both.
      `cd ~/src/app && claude --resume <id>`, `codex resume <id>`, or `grok --resume <id>`
    - the initial prompt
    - buttons for status, note, and adding a PR
+- **Daily** and **Weekly** buttons in the top bar open a summary written by Claude (Opus 5.5):
+  an executive summary in prose, what got done, and what is still open. Nothing calls Claude
+  until you click. Daily covers the previous workday (Friday through Sunday on a Monday) and
+  runs at most once a day; later clicks show that day's copy. Weekly covers the last 7 days
+  and runs again whenever you click **Run again**. The calls go through `claude -p` with no
+  tools and no settings, so they use your Claude Code login and need no API key.
 
 ## CLI
 
@@ -72,6 +78,7 @@ gj note text... [--id N]          gj edit --id N [--title|--epic|--prompt]
 gj ls [-a] [-s] [--json]          gj resume N          gj rm N
 gj sync [--all]                   gj serve [--port 7777] [--open]
 gj service install|uninstall|status [--port 7777] [--open]
+gj summary daily|weekly [--digest]   # --digest prints Claude's input without calling it
 ```
 
 Commands with no `--id` act on the effort registered by the calling agent session.

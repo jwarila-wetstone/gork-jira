@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -66,9 +66,18 @@ CREATE TABLE IF NOT EXISTS prs (
     mergeable      TEXT NOT NULL DEFAULT '',   -- MERGEABLE / CONFLICTING / UNKNOWN
     auto_merge     TEXT NOT NULL DEFAULT '',   -- merge method when auto-merge is on, else ''
     pr_updated_at  REAL NOT NULL DEFAULT 0,
+    closed_at      REAL NOT NULL DEFAULT 0,    -- when it merged or closed
     synced_at      REAL NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS efforts_session ON efforts(agent, session_id);
+CREATE TABLE IF NOT EXISTS summaries (
+    kind        TEXT NOT NULL,   -- daily / weekly
+    day         TEXT NOT NULL,   -- local date it was made
+    text        TEXT NOT NULL,
+    span        TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (kind, day)
+);
 """
 
 
@@ -84,6 +93,8 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(prs)")}
     if "auto_merge" not in cols:
         conn.execute("ALTER TABLE prs ADD COLUMN auto_merge TEXT NOT NULL DEFAULT ''")
+    if "closed_at" not in cols:
+        conn.execute("ALTER TABLE prs ADD COLUMN closed_at REAL NOT NULL DEFAULT 0")
     ecols = {r[1] for r in conn.execute("PRAGMA table_info(efforts)")}
     if "stage" not in ecols:
         conn.execute("ALTER TABLE efforts ADD COLUMN stage TEXT NOT NULL DEFAULT ''")
@@ -433,7 +444,7 @@ def cmd_rm(args):
 
 # ---------------------------------------------------------------- github sync
 
-GH_FIELDS = ("number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,updatedAt,"
+GH_FIELDS = ("closedAt,number,title,state,isDraft,reviewDecision,mergeable,statusCheckRollup,updatedAt,"
              "autoMergeRequest")
 
 
@@ -468,11 +479,11 @@ def sync_prs(conn, urls):
         ok += 1
         conn.execute(
             "UPDATE prs SET title=?, state=?, draft=?, review=?, checks=?, mergeable=?, "
-            "auto_merge=?, pr_updated_at=?, synced_at=? WHERE url=?",
+            "auto_merge=?, pr_updated_at=?, closed_at=?, synced_at=? WHERE url=?",
             (d["title"], d["state"], int(d["isDraft"]), d.get("reviewDecision") or "",
              rollup(d.get("statusCheckRollup")), d.get("mergeable") or "",
              (d.get("autoMergeRequest") or {}).get("mergeMethod") or "",
-             parse_ts(d.get("updatedAt")), now(), url))
+             parse_ts(d.get("updatedAt")), parse_ts(d.get("closedAt")), now(), url))
     conn.commit()
     return ok, len(urls)
 
@@ -823,6 +834,169 @@ def board(conn):
     return {"now": now(), "synced": last or 0, "efforts": out}
 
 
+# ---------------------------------------------------------------- summaries
+
+SUMMARY_MODEL = "claude-opus-5-5"
+SUMMARY_PROMPTS = {
+    "daily": """You write a developer's morning summary of the software work their AI coding agents did.
+The input lists every tracked effort: what happened in the window, and what is still open now.
+Write Markdown with exactly these three sections and nothing before or after:
+
+## Executive summary
+Two or three short sentences of plain prose, under 60 words: what got done and what is in flight. No bullets.
+
+## Done
+One bullet per effort that finished or merged a PR in the window: what it changed, in plain words,
+then its PRs as links like [repo#123](url). Write "Nothing merged." if there is none.
+
+## Still open
+Bullets in this order, skipping empty groups: **Needs you** (say what it needs), **In review**,
+**In progress**, then one bullet listing quiet efforts by title only.
+
+Be short and concrete. Use only facts in the input. Never invent status or results.""",
+    "weekly": """You write a developer's weekly summary of the software work their AI coding agents did.
+The input lists every tracked effort: what happened in the last 7 days, and what is still open now.
+Stay high level: group work into themes (use epics where given) instead of listing every PR.
+Write Markdown with exactly these three sections and nothing before or after:
+
+## Executive summary
+Three or four short sentences of plain prose, under 90 words: the week's main outcomes and what is stuck.
+No bullets, no lists of PRs.
+
+## Done
+One bullet per theme: what shipped and why it matters, with the key PRs as links like [repo#123](url).
+
+## Still open
+One bullet per theme or effort still in flight: where it stands and what it is waiting on.
+Lead with what needs the developer. Put quiet efforts in one final bullet, titles only.
+
+Be short and concrete. Use only facts in the input. Never invent status or results.""",
+}
+_summary_lock = threading.Lock()
+
+
+def summary_span(kind, t=None):
+    """(start, end, label): the previous workday for daily (Friday through Sunday on a Monday),
+    the last 7 days for weekly."""
+    t = t or now()
+    if kind == "weekly":
+        return t - 7 * 86400, t, "last 7 days"
+    today = datetime.fromtimestamp(t).date()   # calendar days, so DST changes don't shift midnight
+    day = today - timedelta(days=1)
+    while day.weekday() >= 5:   # back over the weekend to Friday
+        day -= timedelta(days=1)
+    label = day.strftime("%a %b %-d")
+    if (today - day).days > 1:
+        label += " through %s" % (today - timedelta(days=1)).strftime("%a %b %-d")
+    midnight = lambda d: datetime.combine(d, datetime.min.time()).timestamp()
+    return midnight(day), midnight(today), label
+
+
+def summary_digest(conn, start, end, efforts=None):
+    """Plain-text facts for the model: what changed in [start, end), and what is open now."""
+    efforts = board(conn)["efforts"] if efforts is None else efforts
+    within = lambda ts: start <= (ts or 0) < end
+    done, open_, quiet = [], [], []
+    for e in efforts:
+        closed = e["status"] in ("done", "dropped")
+        moved = [p for p in e["prs"] if p["state"] in ("MERGED", "CLOSED") and within(closed_at(p))]
+        active = moved or any(within(x) for x in (e["created_at"], e["updated_at"], e.get("stage_at"),
+                                                   (e.get("live") or {}).get("seen")))
+        if closed and not (within(e["updated_at"]) or moved):
+            continue
+        if not closed and e.get("lane") == "idle" and not active:
+            quiet.append("#%d %s" % (e["id"], e["title"]))
+            continue
+        lines = ["### #%d %s%s" % (e["id"], e["title"], " [epic: %s]" % e["epic"] if e["epic"] else "")]
+        lines.append("status: %s; stage: %s; board column: %s%s; active in window: %s" % (
+            e["status"], e.get("stage") or "-", e.get("lane") or "-",
+            " (%s)" % e["why"] if e.get("why") else "", "yes" if active else "no"))
+        if e["prompt"]:
+            lines.append("request: " + clip(e["prompt"], 400))
+        if e["note"]:
+            lines.append("note: " + clip(e["note"], 300))
+        earlier = [p for p in e["prs"] if p["state"] in ("MERGED", "CLOSED") and p not in moved]
+        if earlier:
+            lines.append("%d earlier PRs already merged or closed" % len(earlier))
+        for p in e["prs"]:
+            if p in earlier:
+                continue
+            bits = [p["state"] or "?"]
+            if p in moved:
+                bits.append("%s in window" % p["state"].lower())
+            bits += [x for x in (p["review"], p["checks"] and "checks " + p["checks"],
+                                 p.get("auto_merge") and "auto-merge on") if x]
+            lines.append("PR %s#%d %s (%s) %s" % (p["repo"].split("/")[-1], p["number"], json.dumps(p["title"]),
+                                                  ", ".join(bits), p["url"]))
+        doing = (e.get("live") or {}).get("doing")
+        if doing:
+            lines.append("agent's latest message: " + clip(doing, 400))
+        (done if closed or (moved and not open_prs_of(e)) else open_).append("\n".join(lines))
+    out = ["# Finished in the window", *(done or ["(none)"]), "", "# Still open now", *(open_ or ["(none)"])]
+    if quiet:
+        out += ["", "# Quiet (open, no activity in the window)", *quiet]
+    return "\n".join(out)
+
+
+def closed_at(p):
+    return p.get("closed_at") or p["pr_updated_at"]   # older rows synced before closedAt was stored
+
+
+def open_prs_of(e):
+    return [p for p in e["prs"] if p["state"] in ("OPEN", "")]
+
+
+def ask_claude(system, text, model=SUMMARY_MODEL):
+    """One tool-less, settings-free `claude -p` call (uses the Claude Code login, no API key)."""
+    cmd = ["claude", "-p", "--model", model, "--tools", "", "--no-session-persistence",
+           "--setting-sources", "", "--strict-mcp-config", "--system-prompt", system]
+    try:
+        r = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=600,
+                           cwd=str(Path(DB_PATH).parent))
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        raise RuntimeError("claude failed: %s" % ex)
+    if r.returncode or not r.stdout.strip():
+        raise RuntimeError("claude failed: " + clip((r.stderr or r.stdout).strip(), 300))
+    return r.stdout.strip()
+
+
+def latest_summary(conn, kind):
+    if kind == "daily":
+        q = "SELECT * FROM summaries WHERE kind = 'daily' AND day = ?"
+        row = conn.execute(q, (datetime.now().date().isoformat(),)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM summaries WHERE kind = ? ORDER BY created_at DESC LIMIT 1",
+                           (kind,)).fetchone()
+    return dict(row) if row else None
+
+
+def make_summary(conn, kind, ask=ask_claude):
+    """Daily runs at most once a day (later calls get the saved copy); weekly runs every time."""
+    with _summary_lock:
+        if kind == "daily":
+            have = latest_summary(conn, kind)
+            if have:
+                return have
+        start, end, label = summary_span(kind)
+        digest = "Window: %s\n\n%s" % (label, summary_digest(conn, start, end))
+        text = ask(SUMMARY_PROMPTS[kind], digest)
+        row = {"kind": kind, "day": datetime.now().date().isoformat(), "text": text, "span": label,
+               "created_at": now()}
+        conn.execute("INSERT OR REPLACE INTO summaries(kind, day, text, span, created_at) "
+                     "VALUES (:kind, :day, :text, :span, :created_at)", row)
+        conn.commit()
+        return row
+
+
+def cmd_summary(args):
+    conn = db()
+    if args.digest:
+        start, end, label = summary_span(args.kind)
+        print("Window: %s\n\n%s" % (label, summary_digest(conn, start, end)))
+        return
+    print(make_summary(conn, args.kind)["text"])
+
+
 # ---------------------------------------------------------------- dashboard
 
 PAGE = r"""<!doctype html>
@@ -950,6 +1124,15 @@ aside.on { transform:none }
 .cmd code { flex:1; min-width:0; background:var(--soft); border-radius:6px; padding:4px 8px; overflow-x:auto; white-space:nowrap; font:11px var(--mono) }
 pre { white-space:pre-wrap; background:var(--soft); padding:8px 10px; border-radius:6px; margin:0; font:11px/1.5 var(--mono); max-height:200px; overflow:auto }
 .actions { display:flex; gap:5px; flex-wrap:wrap }
+.md { font-size:13px; line-height:1.5; overflow-wrap:anywhere }
+.md h3 { margin:14px 0 4px; font-size:10.5px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--faint) }
+.md p { margin:4px 0 }
+.md ul { margin:2px 0; padding-left:18px } .md li { margin:3px 0 } .md li.nest { margin-left:16px; list-style:circle }
+.md a { color:var(--rev); text-decoration:none } .md a:hover { text-decoration:underline }
+.md code { font:11.5px var(--mono); background:var(--soft); padding:0 4px; border-radius:4px }
+.sumfoot { margin-top:14px; font-size:11px; color:var(--faint); display:flex; gap:8px; align-items:center }
+.wait { display:flex; gap:8px; align-items:center; color:var(--mut); font-size:12.5px; margin-top:14px }
+.wait .pulse { flex:none }
 
 .toast { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); background:var(--fg); color:var(--bg); padding:6px 12px;
   border-radius:8px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:30; font-size:12px }
@@ -970,6 +1153,8 @@ pre { white-space:pre-wrap; background:var(--soft); padding:8px 10px; border-rad
   <span class="grow"></span>
   <span class="tools">
     <input id="q" placeholder="Filter  /" autocomplete="off">
+    <button class="btn" id="dailybtn" data-sum="daily" title="Yesterday's work and what's open (Claude, once a day)">Daily</button>
+    <button class="btn" id="weeklybtn" data-sum="weekly" title="This week at a high level (Claude, runs on demand)">Weekly</button>
     <button class="btn" id="syncbtn" title="Pull PR state from GitHub">Sync</button>
     <span id="synced"></span>
   </span>
@@ -1118,10 +1303,54 @@ function drawer() {
   $('drawer').querySelector('.dbody').scrollTop = top;
   $('drawer').classList.add('on'); $('shade').classList.add('on'); $('drawer').setAttribute('aria-hidden', 'false');
 }
-function openDrawer(id) { openId = id; $('drawer').innerHTML = ''; render(); }
+function openDrawer(id) { sumKind = null; openId = id; $('drawer').innerHTML = ''; render(); }
 function closeDrawer() {
-  openId = null; $('drawer').classList.remove('on'); $('shade').classList.remove('on'); $('drawer').setAttribute('aria-hidden', 'true');
+  openId = null; sumKind = null; $('drawer').classList.remove('on'); $('shade').classList.remove('on'); $('drawer').setAttribute('aria-hidden', 'true');
   document.querySelectorAll('.sel').forEach(x => x.classList.remove('sel'));
+}
+
+// ---- Claude summaries: nothing runs until a button is clicked
+let sumKind = null;
+const SUM_TITLES = {daily: 'Daily summary', weekly: 'Weekly summary'};
+function md(t) {
+  const inline = s => esc(s)
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  let out = '', list = false;
+  for (const raw of t.split('\n')) {
+    const line = raw.trim(), li = line.match(/^[-*] (.*)/);
+    if (list && !li) { out += '</ul>'; list = false; }
+    if (li) { if (!list) { out += '<ul>'; list = true; } out += `<li${/^\s{2,}/.test(raw) ? ' class="nest"' : ''}>${inline(li[1])}</li>`; }
+    else if (/^#+ /.test(line)) out += `<h3>${inline(line.replace(/^#+ /, ''))}</h3>`;
+    else if (line) out += `<p>${inline(line)}</p>`;
+  }
+  return out + (list ? '</ul>' : '');
+}
+function sumView(kind, row, busy, err) {
+  if (sumKind !== kind) return;
+  const when = row && row.created_at ? new Date(row.created_at * 1000) : null;
+  const model = row && row.model ? row.model.replace('claude-', '').replace(/-(\d+)-(\d+)$/, ' $1.$2').replace(/^./, c => c.toUpperCase()) : '';
+  $('drawer').innerHTML = `<div class="dhead"><span class="title">${SUM_TITLES[kind]}${row && row.span ? ' · ' + esc(row.span) : ''}</span><button class="x" data-act="close" title="Close (Esc)">×</button></div>
+    <div class="dbody">
+      ${err ? `<div class="txt why" style="color:var(--bad)">${esc(err)}</div>` : ''}
+      ${busy ? `<div class="wait"><span class="pulse"></span>Asking Claude${model ? ' ' + esc(model) : ''}… this takes up to a minute.</div>` : ''}
+      ${row && row.text ? `<div class="md">${md(row.text)}</div>` : ''}
+      ${when ? `<div class="sumfoot">Written ${when.toLocaleString([], {weekday: 'short', hour: 'numeric', minute: '2-digit'})} by ${esc(model)}
+        ${kind === 'weekly' && !busy ? '<button class="btn" data-sum="weekly" data-run="1">Run again</button>' : ''}</div>` : ''}
+    </div>`;
+  $('drawer').classList.add('on'); $('shade').classList.add('on'); $('drawer').setAttribute('aria-hidden', 'false');
+}
+async function summary(kind, rerun) {
+  openId = null; sumKind = kind;
+  document.querySelectorAll('.sel').forEach(x => x.classList.remove('sel'));
+  let row = null;
+  try { row = await (await fetch('/api/summary?kind=' + kind, {cache: 'no-store'})).json(); } catch (e) {}
+  if (row && row.text && !rerun) return sumView(kind, row);   // daily: today's copy; weekly: the last run
+  sumView(kind, row, true);
+  const b = $(kind + 'btn'); b.disabled = true;
+  try { sumView(kind, await post('/api/summary', {kind}), false); }
+  catch (e) { sumView(kind, row, false, e.message); }
+  b.disabled = false;
 }
 
 function tick() {
@@ -1144,6 +1373,8 @@ async function post(path, body) {
 }
 
 document.addEventListener('click', async ev => {
+  const sb = ev.target.closest('[data-sum]');
+  if (sb) return summary(sb.dataset.sum, !!sb.dataset.run);
   const btn = ev.target.closest('[data-act]');
   if (btn) {
     const act = btn.dataset.act;
@@ -1173,7 +1404,7 @@ $('q').addEventListener('input', render);
 document.addEventListener('keydown', e => {
   if (e.key === '/' && document.activeElement !== $('q')) { e.preventDefault(); $('q').focus(); }
   if (e.key === 'Escape') {
-    if (openId !== null) closeDrawer();
+    if (openId !== null || sumKind) closeDrawer();
     else { $('q').value = ''; $('q').blur(); render(); }
   }
 });
@@ -1206,6 +1437,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, PAGE, "text/html")
         elif u.path == "/api/board":
             self.send(200, json.dumps(board(conn), default=str))
+        elif u.path == "/api/summary" and q.get("kind", [""])[0] in SUMMARY_PROMPTS:
+            row = latest_summary(conn, q["kind"][0])
+            self.send(200, json.dumps(dict(row or {}, model=SUMMARY_MODEL)))
         elif u.path == "/api/efforts":
             self.send(200, json.dumps(load(conn, "closed" in q), default=str))
         else:
@@ -1222,6 +1456,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/sync":
                 r = sync_all(conn)
                 return self.send(200, json.dumps({k: r[k] for k in ("synced", "total")}))
+            if self.path == "/api/summary" and body.get("kind") in SUMMARY_PROMPTS:
+                try:
+                    row = make_summary(conn, body["kind"])
+                except RuntimeError as ex:
+                    return self.send(502, json.dumps({"error": str(ex)}))
+                return self.send(200, json.dumps(dict(row, model=SUMMARY_MODEL)))
             eid = int(body["id"])
             if self.path == "/api/status" and body.get("status") in STATUSES:
                 touch(conn, eid, status=body["status"])
@@ -1461,6 +1701,11 @@ def main(argv=None):
     p.add_argument("--note", help="e.g. the verification evidence")
     p.add_argument("--id", type=int)
     p.set_defaults(fn=cmd_stage)
+
+    p = sub.add_parser("summary", help="Claude's daily (once a day) or weekly summary")
+    p.add_argument("kind", choices=sorted(SUMMARY_PROMPTS))
+    p.add_argument("--digest", action="store_true", help="print the input instead of calling Claude")
+    p.set_defaults(fn=cmd_summary)
 
     p = sub.add_parser("note", help="set the effort's note")
     p.add_argument("text", nargs="+")
