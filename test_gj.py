@@ -1,4 +1,5 @@
 import importlib.machinery
+import json
 import os
 import tempfile
 import time
@@ -161,6 +162,35 @@ class Live(unittest.TestCase):
         # a fresh PR next to a stale one keeps the effort in review
         self.assertEqual(gj.lane(dict(e(prs=[stale, pr(number=8)], updated_at=old),
                                       live=live("done", old))), ("review", "#7 stale 10d"))
+
+    def test_subagent_keeps_working(self):
+        d = Path(tempfile.mkdtemp())
+        main = d / "sid.jsonl"
+        main.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Waiting on the inventory agent."}]}}) + "\n")
+        os.utime(main, (time.time() - 600, time.time() - 600))
+        subs = d / "sid" / "subagents"
+        subs.mkdir(parents=True)
+        sub = subs / "agent-a1.jsonl"
+        tool = lambda name, **inp: json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": name, "input": inp}]}}) + "\n"
+        sub.write_text(tool("Bash", description="Count objects under prefixes"))
+        gj._log_paths[("claude", "sid")] = main
+        e = effort(agent="claude", session_id="sid")
+        live = gj.liveness(e)
+        self.assertEqual((live["state"], live["doing"]), ("working", "Subagent · Bash: Count objects under prefixes"))
+        sub.write_text(tool("SubagentHandback", message="done"))
+        self.assertEqual(gj.liveness(e)["state"], "done")
+        sub.write_text(tool("Bash", description="x"))
+        os.utime(sub, (time.time() - 600, time.time() - 600))
+        self.assertEqual(gj.liveness(e)["state"], "done")
+        # with meta: it runs until it says finished, even through a long silent command
+        meta = subs / "agent-a1.meta.json"
+        meta.write_text(json.dumps({"finished": False}))
+        self.assertEqual(gj.liveness(e)["state"], "working")
+        meta.write_text(json.dumps({"finished": True}))
+        os.utime(sub)
+        self.assertEqual(gj.liveness(e)["state"], "done")
 
 
 class Stages(unittest.TestCase):

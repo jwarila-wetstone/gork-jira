@@ -771,7 +771,42 @@ def liveness(e):
         state = "done"
     else:
         state = "working" if now() - seen < WORKING_SECS else "stalled"
+    if state != "working" and e["agent"] == "claude":
+        sub = subagent_live(p)   # the main log goes quiet while it waits on a subagent
+        if sub:
+            seen, state, doing = max(seen, sub[0]), "working", "Subagent · " + sub[1]
     return {"seen": seen, "state": state, "doing": doing}
+
+
+def subagent_live(log):
+    """(mtime, doing) for a Claude subagent of this session that is still running, else None.
+    Subagents log to <session>/subagents/agent-*.jsonl, with a .meta.json that says when they
+    finish; without one, a recent log that hasn't handed back counts."""
+    try:
+        logs = [(f.stat().st_mtime, f) for f in log.with_suffix("").joinpath("subagents").glob("agent-*.jsonl")]
+    except OSError:
+        return None
+    for mtime, f in sorted(logs, reverse=True):
+        if now() - mtime >= 3600:   # a running subagent that has been silent this long is gone
+            break
+        try:
+            meta = json.loads(f.with_name(f.name[:-len(".jsonl")] + ".meta.json").read_text())
+        except (OSError, ValueError):
+            meta = None
+        if meta and meta.get("finished"):
+            continue
+        if not meta and now() - mtime >= WORKING_SECS:
+            continue
+        entries = []
+        for line in tail_lines(f):
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                pass
+        done, doing = claude_turn(entries)
+        if meta or not (done or doing.startswith("SubagentHandback")):
+            return mtime, doing
+    return None
 
 
 def lane(e):
