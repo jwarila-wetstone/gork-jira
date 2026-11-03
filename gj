@@ -350,7 +350,8 @@ def cmd_pr(args):
     e = current_effort(conn, args)
     urls = [add_pr(conn, e["id"], u) for u in args.urls]
     repo, branch = git_info(e["cwd"]) if e["cwd"] and os.path.isdir(e["cwd"]) else ("", "")
-    fields = {"status": "review"} if e["status"] == "active" else {}
+    # A new PR reopens a closed effort: a long effort's next piece.
+    fields = {"status": "review"} if e["status"] in ("active", "done", "dropped") else {}
     if branch:
         fields.update(branch=branch, repo=repo or e["repo"])
     touch(conn, e["id"], **fields)
@@ -376,7 +377,7 @@ def cmd_stage(args):
     fields = {"stage": args.stage, "stage_at": now()}
     if args.note is not None:
         fields["note"] = args.note
-    if e["status"] == "blocked":
+    if e["status"] in ("blocked", "done", "dropped"):
         fields["status"] = "active"
     touch(conn, e["id"], **fields)
     conn.commit()
@@ -507,7 +508,7 @@ def auto_close(conn):
     A blocked effort closes too when its last PR closed after it was blocked: the block was
     about getting the PR out. A block set after the merge (follow-up work) stays open."""
     rows = conn.execute(
-        "SELECT e.id, e.status, e.updated_at, e.stage_at, SUM(p.state = 'MERGED') merged, "
+        "SELECT e.id, e.status, e.updated_at, e.stage_at, e.agent, e.session_id, e.cwd, SUM(p.state = 'MERGED') merged, "
         "SUM(p.state IN ('MERGED','CLOSED')) shut, COUNT(*) n, MAX(p.pr_updated_at) last_pr "
         "FROM efforts e JOIN prs p ON p.effort_id = e.id "
         "WHERE e.status IN ('active','review','blocked') GROUP BY e.id").fetchall()
@@ -517,6 +518,8 @@ def auto_close(conn):
             continue   # never auto-drop a blocked effort; its PR may come back in another form
         if (r["stage_at"] or 0) > (r["last_pr"] or 0):
             continue   # the agent reported work after the last PR: a long effort, still going
+        if liveness(dict(r))["state"] == "working":
+            continue   # its agent is mid-turn, likely on the next piece
         if r["n"] and r["shut"] == r["n"]:
             status = "done" if r["merged"] else "dropped"
             touch(conn, r["id"], status=status)
@@ -797,12 +800,23 @@ def board(conn):
     efforts = load(conn, include_closed=True)
     week = now() - 7 * 86400
     out = []
+    owner = {}   # a session's newest effort is the one its live work belongs to
+    for e in efforts:
+        k = (e["agent"], e["session_id"])
+        if e["session_id"] and e["id"] > owner.get(k, 0):
+            owner[k] = e["id"]
     for e in efforts:
         closed = e["status"] in ("done", "dropped")
         if closed and e["updated_at"] < week:
             continue
-        e["live"] = liveness(e) if not closed else {"seen": 0, "state": "", "doing": ""}
-        e["lane"], e["why"] = ("shipped", "") if closed else lane(e)
+        e["live"] = liveness(e)
+        live = e["live"]
+        mine = owner.get((e["agent"], e["session_id"]), e["id"]) == e["id"]
+        if closed and not (mine and (live["state"] == "working" or (
+                live["state"] == "stalled" and now() - live["seen"] < 86400))):
+            e["lane"], e["why"] = "shipped", ""
+        else:   # an agent still mid-turn on a closed effort keeps it on the board
+            e["lane"], e["why"] = lane(e)
         e["last_activity"] = max(e["last_activity"], e["live"]["seen"])
         out.append(e)
     last = conn.execute("SELECT MAX(synced_at) FROM prs").fetchone()[0]

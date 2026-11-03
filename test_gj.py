@@ -220,6 +220,38 @@ class Stages(unittest.TestCase):
         gj.cmd_stage(type("A", (), {"id": eid, "stage": "review", "note": "e2e green"}))
         row = gj.db().execute("SELECT * FROM efforts WHERE id = ?", (eid,)).fetchone()
         self.assertEqual((row["stage"], row["note"], row["status"]), ("review", "e2e green", "active"))
+        # a stage report on a closed effort reopens it: the next piece of a long effort
+        conn.execute("UPDATE efforts SET status = 'done' WHERE id = ?", (eid,))
+        conn.commit()
+        gj.cmd_stage(type("A", (), {"id": eid, "stage": "build", "note": None}))
+        row = gj.db().execute("SELECT * FROM efforts WHERE id = ?", (eid,)).fetchone()
+        self.assertEqual(row["status"], "active")
+
+    def test_working_agent_keeps_effort(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, status, created_at, updated_at) "
+                           "VALUES ('x', 'review', 0, 0)").lastrowid
+        gj.add_pr(conn, eid, "https://github.com/a/b/pull/60")
+        conn.execute("UPDATE prs SET state = 'MERGED', pr_updated_at = 1000 WHERE number = 60")
+        real = gj.liveness
+        gj.liveness = lambda e: {"seen": time.time(), "state": "working", "doing": "x"}
+        try:
+            self.assertEqual(gj.auto_close(conn), [])
+            conn.execute("UPDATE efforts SET status = 'done', updated_at = ? WHERE id = ?",
+                         (time.time(), eid))
+            lanes = {e["id"]: e["lane"] for e in gj.board(conn)["efforts"]}
+            self.assertEqual(lanes[eid], "working")
+            # a newer effort in the same session owns the live work
+            old = conn.execute("INSERT INTO efforts(title, status, agent, session_id, created_at, "
+                               "updated_at) VALUES ('a', 'done', 'claude', 's9', 0, ?)",
+                               (time.time(),)).lastrowid
+            conn.execute("INSERT INTO efforts(title, status, agent, session_id, created_at, "
+                         "updated_at) VALUES ('b', 'active', 'claude', 's9', 0, ?)", (time.time(),))
+            lanes = {e["id"]: e["lane"] for e in gj.board(conn)["efforts"]}
+            self.assertEqual(lanes[old], "shipped")
+        finally:
+            gj.liveness = real
+        self.assertEqual(gj.auto_close(conn), [])   # already done; nothing left to close
 
 
 if __name__ == "__main__":
