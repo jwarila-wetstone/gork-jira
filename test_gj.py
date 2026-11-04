@@ -285,6 +285,59 @@ class Stages(unittest.TestCase):
 
 
 
+class Codex(unittest.TestCase):
+    R = "<!-- codex-review-receipt:v1 -->"
+
+    def test_state(self):
+        c = lambda at, body: {"created_at": at, "body": body}
+        comments = [c("2026-11-03T00:17:00Z", "@codex review"),
+                    c("2026-11-03T00:22:00Z", self.R + "\n\nCodex Review: Didn't find any major issues."),
+                    c("2026-11-03T00:30:00Z", "@codex security review")]
+        reviews = [{"submitted_at": "2026-11-02T22:49:00Z", "id": 1, "body": self.R + " Codex Review"},
+                   {"submitted_at": None, "id": 2, "body": self.R}]
+        asked, receipts = gj.codex_state(comments, reviews)
+        self.assertEqual(asked, gj.parse_ts("2026-11-03T00:17:00Z"))
+        self.assertEqual([(r["id"], r["clean"]) for r in receipts], [(1, False), (None, True)])
+        # a fresh request with nothing after it: still waiting
+        comments.append(c("2026-11-03T01:00:00Z", "@codex review"))
+        asked, receipts = gj.codex_state(comments, reviews)
+        self.assertEqual([r for r in receipts if r["at"] > asked], [])
+
+    def test_finding(self):
+        body = ("**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub>  Move the note**\n\n"
+                "It belongs in the README.\n\nUseful? React with 👍 / 👎.\n<!-- codex-code-review-finding:v1 -->")
+        self.assertEqual(gj.codex_finding({"body": body, "path": "a/b.ts", "line": 3}),
+                         "- [P1] a/b.ts:3\n  Move the note: It belongs in the README.")
+
+    def test_wait(self):
+        import io, contextlib
+        polls = []
+        ask = {"created_at": "2026-11-03T01:00:00Z", "body": "@codex review"}
+        review = {"submitted_at": "2026-11-03T01:05:00Z", "id": 9, "body": self.R}
+        finding = {"body": "**Bug**\nOff by one.", "path": "x.py", "line": 7}
+
+        def items(path):
+            if path.endswith("/reviews/9/comments"):
+                return [finding]
+            if path.endswith("/issues/1/comments"):
+                polls.append(1)
+                return [ask]
+            return [review] if len(polls) > 1 else []
+        real = gj.gh_items, gj.run, gj.time.sleep
+        gj.gh_items, gj.run, gj.time.sleep = items, lambda *a, **k: "OPEN", lambda s: None
+        args = type("A", (), dict(pr="https://github.com/a/b/pull/1", request=False, timeout=5,
+                                  interval=0, id=None))
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                gj.cmd_codex_wait(args)
+        finally:
+            gj.gh_items, gj.run, gj.time.sleep = real
+        self.assertEqual(len(polls), 2)
+        self.assertIn("1 finding(s). Rounds with findings: 1 of 3", out.getvalue())
+        self.assertIn("- x.py:7\n  Bug: Off by one.", out.getvalue())
+
+
 class Summaries(unittest.TestCase):
     def setUp(self):
         gj.DB_PATH = Path(tempfile.mkdtemp()) / "gj.db"

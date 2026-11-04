@@ -869,6 +869,95 @@ def board(conn):
     return {"now": now(), "synced": last or 0, "efforts": out}
 
 
+# ---------------------------------------------------------------- codex review loop
+
+CODEX_RECEIPT = "<!-- codex-review-receipt:v1 -->"
+CODEX_ROUNDS = 3
+
+
+def gh_items(path):
+    """Every item of a paginated GitHub list endpoint, or None if gh fails."""
+    out = run(["gh", "api", "--paginate", path + "?per_page=100", "--jq", ".[]"], timeout=60)
+    if out is None:
+        return None
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def codex_state(comments, reviews):
+    """(time of the latest `@codex review` request or 0, Codex's receipts oldest first).
+    Findings come as a PR review, a clean pass as an issue comment; both carry the receipt marker."""
+    asked = max([parse_ts(c["created_at"]) for c in comments
+                 if re.match(r"\s*@codex review\b", c.get("body") or "")] or [0])
+    receipts = [{"at": parse_ts(c["created_at"]), "id": None, "body": c["body"],
+                 "clean": "find any major issues" in c["body"]}
+                for c in comments if CODEX_RECEIPT in (c.get("body") or "")]
+    receipts += [{"at": parse_ts(r["submitted_at"]), "id": r["id"], "body": r["body"], "clean": False}
+                 for r in reviews if CODEX_RECEIPT in (r.get("body") or "") and r.get("submitted_at")]
+    return asked, sorted(receipts, key=lambda r: r["at"])
+
+
+def codex_finding(c):
+    """One inline Codex comment as plain text: [P1] path:line, then the body without badges."""
+    body = c.get("body") or ""
+    prio = re.search(r"!\[(P\d) Badge\]", body)
+    body = re.sub(r"<sub>|</sub>|!\[[^\]]*\]\([^)]*\)", "", body)
+    body = re.sub(r"Useful\? React with .*|<!--.*?-->", "", body)
+    body = re.sub(r"^\s*\*\*\s*(.+?)\*\*", r"\1:", body, count=1)   # the bold title line
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    return "- %s%s:%s\n  %s" % ("[%s] " % prio.group(1) if prio else "", c.get("path"),
+                                 c.get("line") or c.get("original_line") or "?",
+                                 clip(body, 1200).replace("\n", "\n  "))
+
+
+def cmd_codex_wait(args):
+    if args.pr:
+        url = args.pr
+    else:
+        conn = db()
+        e = current_effort(conn, args)
+        row = conn.execute("SELECT url FROM prs WHERE effort_id = ? ORDER BY state IN ('OPEN', '') DESC, "
+                           "number DESC LIMIT 1", (e["id"],)).fetchone()
+        if not row:
+            sys.exit("gj: no PR linked to #%d; pass the PR url" % e["id"])
+        url = row["url"]
+    m = PR_RE.search(url)
+    if not m:
+        sys.exit("gj: not a GitHub PR url: %s" % url)
+    repo, num = m.group(1), m.group(2)
+    if args.request and run(["gh", "pr", "comment", url, "--body", "@codex review"]) is None:
+        sys.exit("gj: couldn't comment @codex review on %s" % url)
+    deadline = now() + args.timeout * 60
+    print("gj: waiting for Codex on %s (up to %d min)" % (url, args.timeout), flush=True)
+    while True:
+        comments = gh_items("repos/%s/issues/%s/comments" % (repo, num))
+        reviews = gh_items("repos/%s/pulls/%s/reviews" % (repo, num))
+        if comments is not None and reviews is not None:
+            asked, receipts = codex_state(comments, reviews)
+            new = [r for r in receipts if r["at"] > asked]
+            if new:
+                r = new[-1]
+                rounds = sum(1 for x in receipts if not x["clean"])
+                n = receipts.index(r) + 1
+                if r["clean"]:
+                    print("Codex review %d on %s: no major issues. The loop is done." % (n, url))
+                    return
+                found = gh_items("repos/%s/pulls/%s/reviews/%s/comments" % (repo, num, r["id"])) or []
+                print("Codex review %d on %s: %d finding(s). Rounds with findings: %d of %d.\n"
+                      % (n, url, len(found), rounds, CODEX_ROUNDS))
+                print("\n".join(codex_finding(c) for c in found) or "(no inline comments; see the PR)")
+                if rounds >= CODEX_ROUNDS:
+                    print("\nThat was the last round: fix what is real, then `gj stage human`.")
+                return
+        state = run(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])
+        if state in ("MERGED", "CLOSED"):
+            print("gj: %s is %s; nothing to wait for." % (url, state.lower()))
+            sys.exit(3)
+        if now() > deadline:
+            print("gj: no Codex review on %s after %d min. Tell the user; don't keep waiting." % (url, args.timeout))
+            sys.exit(2)
+        time.sleep(args.interval)
+
+
 # ---------------------------------------------------------------- summaries
 
 SUMMARY_MODEL = "claude-opus-5-5"
@@ -1576,14 +1665,20 @@ For building work, do this without being asked:
 
    A long effort goes around more than once. When one PR is out and the next piece starts, report
    `gj stage plan` (or `build`) again. The effort stays open while you report work after its last PR.
-3. **Codex review loop.** Codex reviews the PR on GitHub when it opens. Each round:
-   - Read its review comments with `gh`. Fix the real findings and re-run the verification the fix touches.
-     Reply on the thread to any finding you disagree with, saying why.
-   - Push, then comment `@codex review` on the PR to request the next round.
-   - Do not sleep or poll for the review. End your turn and tell the user what you pushed; the user tells
-     you when the next review is in.
-   - Stop after 3 rounds, or sooner when nothing Codex raises is a real problem. Then run `gj stage human`
-     and summarize what is still open for the human reviewer.
+3. **Codex review loop.** Drive it yourself; don't wait for the user to tell you a review is in.
+   Codex reviews the PR on GitHub when it opens. Each round:
+   - Wait for the review with `gj codex-wait`. It watches GitHub without using tokens and prints the
+     review when it lands: the round, and each finding with its file and line. In Claude Code, run it
+     as a background command (`run_in_background`); you are woken when it finishes, so end your turn
+     meanwhile. Elsewhere, run it in the foreground with a 45-minute command timeout.
+     Never write your own sleep or polling loop.
+   - If it reports no major issues, the loop is done.
+   - Otherwise fix the real findings and re-run the verification the fix touches. Reply on the thread to
+     any finding you disagree with, saying why. Push, then run `gj codex-wait --request`: it comments
+     `@codex review` and waits for the next round.
+   - Stop after 3 rounds with findings, or sooner when nothing Codex raises is a real problem. Then run
+     `gj stage human` and summarize what is still open for the human reviewer. If `gj codex-wait`
+     times out, tell the user and stop.
 4. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
    When the work is finished without a PR: `gj status done`.
 
@@ -1736,6 +1831,14 @@ def main(argv=None):
     p.add_argument("--note", help="e.g. the verification evidence")
     p.add_argument("--id", type=int)
     p.set_defaults(fn=cmd_stage)
+
+    p = sub.add_parser("codex-wait", help="wait for Codex's next review of a PR and print it")
+    p.add_argument("pr", nargs="?", help="PR url (default: this effort's open PR)")
+    p.add_argument("--request", action="store_true", help="comment @codex review first")
+    p.add_argument("--timeout", type=int, default=40, help="minutes (default 40)")
+    p.add_argument("--interval", type=int, default=45, help=argparse.SUPPRESS)
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_codex_wait)
 
     p = sub.add_parser("summary", help="Claude's daily (once a day) or weekly summary")
     p.add_argument("kind", choices=sorted(SUMMARY_PROMPTS))

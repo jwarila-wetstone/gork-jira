@@ -78,6 +78,7 @@ gj note text... [--id N]          gj edit --id N [--title|--epic|--prompt]
 gj ls [-a] [-s] [--json]          gj resume N          gj rm N
 gj sync [--all]                   gj serve [--port 7777] [--open]
 gj service install|uninstall|status [--port 7777] [--open]
+gj codex-wait [PR] [--request] [--timeout 40]   # wait for Codex's next review and print it
 gj summary daily|weekly [--digest]   # --digest prints Claude's input without calling it
 ```
 
