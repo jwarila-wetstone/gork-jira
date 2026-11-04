@@ -858,7 +858,8 @@ def board(conn):
         e["live"] = liveness(e)
         live = e["live"]
         mine = owner.get((e["agent"], e["session_id"]), e["id"]) == e["id"]
-        if closed and not (mine and (live["state"] == "working" or (
+        # a closed effort stays in play only if its agent kept going after it closed
+        if closed and not (mine and live["seen"] > e["updated_at"] and (live["state"] == "working" or (
                 live["state"] == "stalled" and now() - live["seen"] < 86400))):
             e["lane"], e["why"] = "shipped", ""
         else:   # an agent still mid-turn on a closed effort keeps it on the board

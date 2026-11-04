@@ -279,6 +279,10 @@ class Stages(unittest.TestCase):
                          "updated_at) VALUES ('b', 'active', 'claude', 's9', 0, ?)", (time.time(),))
             lanes = {e["id"]: e["lane"] for e in gj.board(conn)["efforts"]}
             self.assertEqual(lanes[old], "shipped")
+            # closed after the agent's last activity: it's finished, whatever the log says
+            gj.liveness = lambda e: {"seen": time.time() - 3600, "state": "stalled", "doing": "x"}
+            lanes = {e["id"]: e["lane"] for e in gj.board(conn)["efforts"]}
+            self.assertEqual(lanes[eid], "shipped")
         finally:
             gj.liveness = real
         self.assertEqual(gj.auto_close(conn), [])   # already done; nothing left to close
