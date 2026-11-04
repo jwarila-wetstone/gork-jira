@@ -775,7 +775,54 @@ def liveness(e):
         sub = subagent_live(p)   # the main log goes quiet while it waits on a subagent
         if sub:
             seen, state, doing = max(seen, sub[0]), "working", "Subagent · " + sub[1]
+        else:
+            shells = background_shells(p)   # or on a background shell it will be woken by
+            if shells:
+                state, doing = "working", "Background shell · " + shells[-1][1]
     return {"seen": seen, "state": state, "doing": doing}
+
+
+_shells = {}   # log path -> [bytes read, {task id: (launched, description)}, {tool_use id: description}]
+SHELL_LAUNCH = re.compile(r'"backgroundTaskId":"(\w+)"')
+SHELL_DONE = re.compile(r"<task-id>(\w+)</task-id>")
+
+
+def background_shells(log):
+    """[(launched, description)] for this Claude session's background shells still running.
+    A launch records backgroundTaskId; the end arrives as a <task-notification> with its id.
+    The log is read incrementally, since main logs run to megabytes."""
+    st = _shells.setdefault(str(log), [0, {}, {}])
+    try:
+        with open(log, "rb") as f:
+            if f.seek(0, 2) < st[0]:   # rewritten: start over
+                st[:] = [0, {}, {}]
+            f.seek(st[0])
+            chunk = f.read()
+    except OSError:
+        return []
+    end = chunk.rfind(b"\n") + 1   # leave a half-written last line for next time
+    st[0] += end
+    for raw in chunk[:end].decode("utf-8", "replace").splitlines():
+        if '"run_in_background":true' in raw or SHELL_LAUNCH.search(raw):
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            for b in (d.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and (b.get("input") or {}).get("run_in_background"):
+                    inp = b["input"]
+                    st[2][b.get("id")] = inp.get("description") or clip(inp.get("command") or "", 80)
+                elif b.get("type") == "tool_result":
+                    tid = (d.get("toolUseResult") or {}).get("backgroundTaskId") if isinstance(
+                        d.get("toolUseResult"), dict) else None
+                    if tid:
+                        st[1][tid] = (parse_ts(d.get("timestamp")) or now(), st[2].get(b.get("tool_use_id"), ""))
+        for tid in SHELL_DONE.findall(raw):
+            st[1].pop(tid, None)
+    # a session that died never reports its shells; give up on them after 6 hours
+    return sorted(v for v in st[1].values() if now() - v[0] < 6 * 3600)
 
 
 def subagent_live(log):

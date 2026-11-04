@@ -192,6 +192,30 @@ class Live(unittest.TestCase):
         os.utime(sub)
         self.assertEqual(gj.liveness(e)["state"], "done")
 
+    def test_background_shell(self):
+        d = Path(tempfile.mkdtemp())
+        log = d / "sid.jsonl"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        lines = [
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash",
+             "input": {"command": "bazel test //x", "description": "Run tests", "run_in_background": True}}]}},
+            {"type": "user", "timestamp": ts, "toolUseResult": {"backgroundTaskId": "b1"},
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "running"}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Tests are running."}]}},
+        ]
+        log.write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in lines))
+        os.utime(log, (time.time() - 600, time.time() - 600))
+        gj._log_paths[("claude", "sh")] = log
+        e = effort(agent="claude", session_id="sh")
+        live = gj.liveness(e)
+        self.assertEqual((live["state"], live["doing"]), ("working", "Background shell · Run tests"))
+        with open(log, "a") as f:   # a half-written line is left for the next read
+            f.write('{"type":"queue-operation","content":"<task-notification>\\n<task-id>b1</task-id>')
+        self.assertEqual(gj.liveness(e)["state"], "working")
+        with open(log, "a") as f:
+            f.write('"}\n')
+        self.assertEqual(gj.liveness(e)["state"], "done")
+
 
 class Stages(unittest.TestCase):
     def test_stage_from_github(self):
