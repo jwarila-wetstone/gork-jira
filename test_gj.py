@@ -379,6 +379,50 @@ class Codex(unittest.TestCase):
         self.assertIn("- x.py:7\n  Bug: Off by one.", out.getvalue())
 
 
+class CI(unittest.TestCase):
+    def test_report(self):
+        c = lambda name, bucket: {"name": name, "bucket": bucket, "state": "", "link": "https://x/actions/runs/5/job/6"}
+        self.assertEqual(gj.ci_report([c("lint", "pass"), c("build", "pending")])[:2], (False, False))
+        done, green, text = gj.ci_report([c("lint", "pass"), c("build", "skipping")])
+        self.assertEqual((done, green), (True, True))
+        self.assertIn("2 required check(s) passed", text)
+        done, green, text = gj.ci_report([c("lint", "pass"), c("build", "fail"), c("fmt", "cancel")])
+        self.assertEqual((done, green), (True, False))
+        self.assertIn("2 of 3", text)
+        self.assertIn("fmt: cancelled (rerun it)", text)
+
+    def test_stage_from_draft(self):
+        self.assertEqual(gj.stage_of(effort(stage="review", stage_at=0, prs=[pr(draft=1)])), "ci")
+        self.assertEqual(gj.stage_of(effort(stage="review", stage_at=0, prs=[pr()])), "codex")
+        # the agent's report wins when it is further along
+        self.assertEqual(gj.stage_of(effort(stage="final", stage_at=0, prs=[pr()])), "final")
+
+    def test_wait(self):
+        import io, contextlib
+        calls = []
+
+        def checks(url):
+            calls.append(1)
+            if len(calls) == 1:
+                return [{"name": "gate", "bucket": "pending", "state": "", "link": ""}]
+            return [{"name": "gate", "bucket": "fail", "state": "", "link": "https://x/actions/runs/5/job/6"}]
+        real = gj.required_checks, gj.failed_jobs, gj.failed_log, gj.run, gj.time.sleep
+        gj.required_checks = checks
+        gj.failed_jobs = lambda repo, runs, gates: [("unit tests", "https://x/actions/runs/5/job/7")]
+        gj.failed_log = lambda repo, link: "boom"
+        gj.run, gj.time.sleep = lambda *a, **k: "OPEN", lambda s: None
+        args = type("A", (), dict(pr="https://github.com/a/b/pull/1", timeout=5, interval=0, id=None))
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ex:
+                gj.cmd_ci_wait(args)
+        finally:
+            gj.required_checks, gj.failed_jobs, gj.failed_log, gj.run, gj.time.sleep = real
+        self.assertEqual(ex.exception.code, 1)
+        self.assertIn("--- unit tests (https://x/actions/runs/5/job/7), end of its failed log:\nboom", out.getvalue())
+        self.assertIn("gh run rerun 5 --failed -R a/b", out.getvalue())
+
+
 class Summaries(unittest.TestCase):
     def setUp(self):
         gj.DB_PATH = Path(tempfile.mkdtemp()) / "gj.db"

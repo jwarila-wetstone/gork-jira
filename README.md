@@ -79,10 +79,15 @@ gj ls [-a] [-s] [--json]          gj resume N          gj rm N
 gj sync [--all]                   gj serve [--port 7777] [--open]
 gj service install|uninstall|status [--port 7777] [--open]
 gj codex-wait [PR] [--request] [--timeout 40]   # wait for Codex's next review and print it
+gj ci-wait [PR] [--timeout 60]                 # wait for required checks; print failures and logs
 gj summary daily|weekly [--digest]   # --digest prints Claude's input without calling it
 ```
 
 Commands with no `--id` act on the effort registered by the calling agent session.
+
+Stages are plan › build › verify › review › ci › codex › final › human › merge. A PR opens as
+a draft so CI goes green (`ci`) before Codex reviews it, and CI goes green again after the review
+(`final`); `gj install` writes the full rules.
 
 Statuses are `active`, `review`, `blocked`, `done`, and `dropped`. Epics are free text, and
 the dashboard groups efforts by epic.

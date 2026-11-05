@@ -32,7 +32,7 @@ STATUSES = ("active", "review", "blocked", "done", "dropped")
 OPEN_STATUSES = ("active", "review", "blocked")
 # The path every effort follows. Agents report plan..review with `gj stage`;
 # pr, codex, human and merge also follow from GitHub state.
-STAGES = ("plan", "build", "verify", "review", "pr", "codex", "human", "merge")
+STAGES = ("plan", "build", "verify", "review", "ci", "codex", "final", "human", "merge")
 PR_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 SCHEMA = """
@@ -93,6 +93,7 @@ def db():
     cols = {r[1] for r in conn.execute("PRAGMA table_info(prs)")}
     if "auto_merge" not in cols:
         conn.execute("ALTER TABLE prs ADD COLUMN auto_merge TEXT NOT NULL DEFAULT ''")
+    conn.execute("UPDATE efforts SET stage = 'ci' WHERE stage = 'pr'")   # pr became ci
     if "closed_at" not in cols:
         conn.execute("ALTER TABLE prs ADD COLUMN closed_at REAL NOT NULL DEFAULT 0")
     ecols = {r[1] for r in conn.execute("PRAGMA table_info(efforts)")}
@@ -408,8 +409,11 @@ def stage_of(e):
         if STAGES.index(x) > rank:
             s, rank = x, STAGES.index(x)
     open_prs = [p for p in e["prs"] if p["state"] in ("OPEN", "")]
-    if any(p["state"] != "CLOSED" for p in e["prs"]):   # a PR closed unmerged doesn't count
+    # a draft is still getting CI green; Codex reviews once it is marked ready
+    if any(p["state"] == "MERGED" or (p["state"] in ("OPEN", "") and not p["draft"]) for p in e["prs"]):
         reach("codex")
+    elif any(p["state"] in ("OPEN", "") for p in e["prs"]):
+        reach("ci")
     if open_prs and all(p["review"] == "APPROVED" for p in open_prs):
         reach("merge")
     if e["prs"] and not open_prs and any(p["state"] == "MERGED" for p in e["prs"]):
@@ -961,10 +965,10 @@ def codex_finding(c):
                                ":%s" % line if line else "", clip(body, 1200).replace("\n", "\n  "))
 
 
-def cmd_codex_wait(args):
-    if args.pr:
-        url = args.pr
-    else:
+def effort_pr(args):
+    """(url, repo, number) of the PR named on the command line, else this effort's open PR."""
+    url = args.pr
+    if not url:
         conn = db()
         e = current_effort(conn, args)
         row = conn.execute("SELECT url FROM prs WHERE effort_id = ? ORDER BY state IN ('OPEN', '') DESC, "
@@ -975,7 +979,17 @@ def cmd_codex_wait(args):
     m = PR_RE.search(url)
     if not m:
         sys.exit("gj: not a GitHub PR url: %s" % url)
-    repo, num = m.group(1), m.group(2)
+    return url, m.group(1), m.group(2)
+
+
+def pr_gone(url):
+    """'merged' / 'closed' if the PR is no longer open, else ''."""
+    state = run(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])
+    return state.lower() if state in ("MERGED", "CLOSED") else ""
+
+
+def cmd_codex_wait(args):
+    url, repo, num = effort_pr(args)
     if args.request and run(["gh", "pr", "comment", url, "--body", "@codex review"]) is None:
         sys.exit("gj: couldn't comment @codex review on %s" % url)
     deadline = now() + args.timeout * 60
@@ -1001,12 +1015,104 @@ def cmd_codex_wait(args):
                 if rounds >= CODEX_ROUNDS:
                     print("\nThat was the last round: fix what is real, then `gj stage human`.")
                 return
-        state = run(["gh", "pr", "view", url, "--json", "state", "--jq", ".state"])
-        if state in ("MERGED", "CLOSED"):
-            print("gj: %s is %s; nothing to wait for." % (url, state.lower()))
+        gone = pr_gone(url)
+        if gone:
+            print("gj: %s is %s; nothing to wait for." % (url, gone))
             sys.exit(3)
         if now() > deadline:
             print("gj: no Codex review on %s after %d min. Tell the user; don't keep waiting." % (url, args.timeout))
+            sys.exit(2)
+        time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------- CI loop
+
+JOB_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+
+
+def required_checks(url):
+    """The PR's required checks on its head commit: [{name, bucket, state, link}], [] if it has
+    none, None if gh failed. (gh exits non-zero while checks pend or fail, so read stdout.)"""
+    try:
+        r = subprocess.run(["gh", "pr", "checks", url, "--required", "--json", "name,state,bucket,link"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.strip()
+    if out.startswith("["):
+        return json.loads(out)
+    return [] if "no required checks" in (r.stderr + out).lower() or "no checks" in (r.stderr + out).lower() else None
+
+
+def failed_log(repo, link, lines=40):
+    """The tail of a GitHub Actions job's failed steps, without gh's job/step/timestamp columns."""
+    m = JOB_RE.search(link or "")
+    if not m:
+        return ""
+    out = run(["gh", "run", "view", "--job", m.group(2), "--log-failed", "-R", repo], timeout=120) or ""
+    log = [re.sub(r"^[^\t]*\t[^\t]*\t\S+ ?", "", l) for l in out.splitlines()]
+    err = next((i for i, l in enumerate(log) if l.startswith("##[error]")), None)
+    if err is not None:   # the failure is just above the first error; after it is only cleanup
+        log = log[:err + 1]
+    return "\n".join(clip(l, 300) for l in log[-lines:])
+
+
+def failed_jobs(repo, runs, gates=()):
+    """[(name, link)] of the failed jobs in these workflow runs. A required gate check (all jobs
+    passed?) fails when another job does, so the job worth reading is usually not the gate."""
+    jobs = []
+    for r in runs:
+        out = run(["gh", "api", "--paginate", "repos/%s/actions/runs/%s/jobs?per_page=100" % (repo, r),
+                   "--jq", '.jobs[] | select(.conclusion == "failure") | [.name, .html_url] | @tsv'], timeout=60)
+        jobs += [tuple(l.split("\t", 1)) for l in (out or "").splitlines() if "\t" in l]
+    real = [j for j in jobs if j[0] not in gates]
+    return real or jobs
+
+
+def ci_report(checks):
+    """(done, green, text) for a list of required checks."""
+    if any(c["bucket"] == "pending" for c in checks):
+        return False, False, ""
+    bad = [c for c in checks if c["bucket"] in ("fail", "cancel")]
+    if not bad:
+        return True, True, "CI green: %d required check(s) passed (%s)." % (
+            len(checks), ", ".join(c["name"] for c in checks))
+    return True, False, "CI failing: %d of %d required check(s).\n" % (len(bad), len(checks)) + "\n".join(
+        "- %s: %s %s" % (c["name"], "cancelled (rerun it)" if c["bucket"] == "cancel" else "failed", c["link"])
+        for c in bad)
+
+
+def cmd_ci_wait(args):
+    url, repo, num = effort_pr(args)
+    start = now()
+    print("gj: waiting for required checks on %s (up to %d min)" % (url, args.timeout), flush=True)
+    while True:
+        checks = required_checks(url)
+        if checks == [] and now() - start > 180:   # a fresh push takes a moment to register checks
+            print("gj: %s has no required checks; nothing to wait for." % url)
+            return
+        if checks:
+            done, green, text = ci_report(checks)
+            if done:
+                print(text)
+                if green:
+                    return
+                runs = sorted({m.group(1) for m in (JOB_RE.search(c["link"] or "") for c in checks
+                                                    if c["bucket"] == "fail") if m})
+                gates = {c["name"] for c in checks if c["bucket"] == "fail"}
+                for name, link in failed_jobs(repo, runs, gates)[:3]:
+                    print("\n--- %s (%s), end of its failed log:\n%s" % (name, link, failed_log(repo, link)))
+                if runs:
+                    print("\nIf a failure is unrelated to this change, rerun it once: "
+                          + "; ".join("gh run rerun %s --failed -R %s" % (r, repo) for r in runs))
+                sys.exit(1)
+        gone = pr_gone(url)
+        if gone:
+            print("gj: %s is %s; nothing to wait for." % (url, gone))
+            sys.exit(3)
+        if now() > start + args.timeout * 60:
+            print("gj: required checks on %s still running after %d min. Tell the user; don't keep waiting."
+                  % (url, args.timeout))
             sys.exit(2)
         time.sleep(args.interval)
 
@@ -1347,9 +1453,9 @@ const LANES = [
   ['review', 'In review', 'No open PRs'],
 ];
 const STATUSES = ['active', 'review', 'blocked', 'done', 'dropped'];
-const STAGES = ['plan', 'build', 'verify', 'review', 'pr', 'codex', 'human', 'merge'];
-const STAGE_NAMES = {plan: 'Plan', build: 'Build', verify: 'Verify', review: 'Self-review', pr: 'PR',
-  codex: 'Codex review', human: 'Human approval', merge: 'Merge'};
+const STAGES = ['plan', 'build', 'verify', 'review', 'ci', 'codex', 'final', 'human', 'merge'];
+const STAGE_NAMES = {plan: 'Plan', build: 'Build', verify: 'Verify', review: 'Self-review', ci: 'CI green',
+  codex: 'Codex review', final: 'Final CI', human: 'Human approval', merge: 'Merge'};
 // Something on GitHub stops this stage from moving (failing checks, conflict, changes requested).
 const BLOCKERS = /checks failing|merge conflict|changes requested/;
 function strip(e) {
@@ -1712,14 +1818,25 @@ For building work, do this without being asked:
    | `plan` | Ask the questions whose answers change the design. Then propose a plan: the change, its risks, and **how you will verify it** (which tests, E2E run, or environment rehearsal). Keep it to a few lines for a small change. Stop and wait. | The user approves it. If the request already settles the approach, say so and go on. |
    | `build` | Implement the plan. | It is built. |
    | `verify` | Run the verification the plan named, in the most realistic environment it calls for. | It passes: `gj stage review --note "<what you ran, where, and the result>"`. If it fails, go back to `build`. |
-   | `review` | Review your own diff once (`/code-review` in Claude Code) and fix what is real. One pass. | Open the PR, then run `gj pr <url>`. |
-   | `codex` | The Codex review loop below. | `gj stage human` |
+   | `review` | Review your own diff once (`/code-review` in Claude Code) and fix what is real. One pass. | Open the PR **as a draft** (`gh pr create --draft`; Codex doesn't review drafts), run `gj pr <url>`, then `gj stage ci`. |
+   | `ci` | Drive the required checks to green: the CI loop below. | It is green: `gh pr ready` (this starts Codex's review), then `gj stage codex`. |
+   | `codex` | The Codex review loop below. | `gj stage final` |
+   | `final` | The CI loop again, on the commits the review added. If nothing was pushed since CI went green, there is nothing to do. | It is green: `gj stage human`, and summarize what is still open for the human reviewer. |
    | `human`, `merge` | Nothing. gj follows approval and merge on GitHub. | |
 
    A long effort goes around more than once. When one PR is out and the next piece starts, report
    `gj stage plan` (or `build`) again. The effort stays open while you report work after its last PR.
-3. **Codex review loop.** Drive it yourself; don't wait for the user to tell you a review is in.
-   Codex reviews the PR on GitHub when it opens. Each round:
+3. **CI loop.** Drive it yourself. Each attempt:
+   - Wait with `gj ci-wait`. It watches the PR's required checks on the latest commit without using tokens
+     and prints each failing check with its link and the end of its failed log. Run it the way you run
+     `gj codex-wait` (below), with a 65-minute command timeout outside Claude Code.
+   - A failure your change caused: fix it, re-run the local check that covers it, push, and wait again.
+   - A failure unrelated to your change (a flaky test, an outage, a registry 429): rerun the failed jobs
+     once with the `gh run rerun` command it prints, and wait again. Don't fix unrelated code in this PR;
+     if it fails again, tell the user.
+   - Stop after 3 pushes that don't turn CI green: `gj status blocked --note "<which check, and why>"`.
+4. **Codex review loop.** Drive it yourself; don't wait for the user to tell you a review is in.
+   Codex reviews the PR on GitHub when it is marked ready. Each round:
    - Wait for the review with `gj codex-wait`. It watches GitHub without using tokens and prints the
      review when it lands: the round, and each finding with its file and line. In Claude Code, run it
      as a background command (`run_in_background`); you are woken when it finishes, so end your turn
@@ -1730,9 +1847,8 @@ For building work, do this without being asked:
      any finding you disagree with, saying why. Push, then run `gj codex-wait --request`: it comments
      `@codex review` and waits for the next round.
    - Stop after 3 rounds with findings, or sooner when nothing Codex raises is a real problem. Then run
-     `gj stage human` and summarize what is still open for the human reviewer. If `gj codex-wait`
-     times out, tell the user and stop.
-4. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
+     `gj stage final`. If `gj codex-wait` times out, tell the user and stop.
+5. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
    When the work is finished without a PR: `gj status done`.
 
 `gj` detects the agent and session on its own. If a `gj` command fails, mention it once and keep working.
@@ -1892,6 +2008,13 @@ def main(argv=None):
     p.add_argument("--interval", type=int, default=45, help=argparse.SUPPRESS)
     p.add_argument("--id", type=int)
     p.set_defaults(fn=cmd_codex_wait)
+
+    p = sub.add_parser("ci-wait", help="wait for a PR's required checks and print any failures")
+    p.add_argument("pr", nargs="?", help="PR url (default: this effort's open PR)")
+    p.add_argument("--timeout", type=int, default=60, help="minutes (default 60)")
+    p.add_argument("--interval", type=int, default=45, help=argparse.SUPPRESS)
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_ci_wait)
 
     p = sub.add_parser("summary", help="Claude's daily (once a day) or weekly summary")
     p.add_argument("kind", choices=sorted(SUMMARY_PROMPTS))
