@@ -478,3 +478,114 @@ class Summaries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class History(unittest.TestCase):
+    def kinds(self, eid):
+        return [(r["kind"], r["value"]) for r in gj.db().execute(
+            "SELECT kind, value FROM events WHERE effort_id = ? ORDER BY id", (eid,))]
+
+    def test_events(self):
+        args = type("A", (), dict(id=None, title="hist", prompt="p", epic=None, pr=None,
+                                  agent="claude", session="h1", cwd="/tmp", new=True))
+        gj.cmd_start(args)
+        eid = gj.db().execute("SELECT MAX(id) FROM efforts").fetchone()[0]
+        gj.cmd_stage(type("A", (), {"id": eid, "stage": "verify", "note": None}))
+        gj.cmd_stage(type("A", (), {"id": eid, "stage": "build", "note": "test failed"}))
+        gj.cmd_status(type("A", (), {"id": eid, "status": "blocked", "note": "need creds"}))
+        gj.cmd_stage(type("A", (), {"id": eid, "stage": "review", "note": None}))   # unblocks it
+        real = gj.sync_prs
+        gj.sync_prs = lambda *a: None
+        try:
+            gj.cmd_pr(type("A", (), {"id": eid, "urls": ["https://github.com/a/b/pull/88"]}))
+        finally:
+            gj.sync_prs = real
+        real_run = gj.run
+        gj.run = lambda *a, **k: "abc123"
+        try:
+            gj.record("https://github.com/a/b/pull/88", "ci", "failed", {"jobs": ["e2e"]})
+            gj.record("https://github.com/a/b/pull/88", "ci", "failed", {"jobs": ["e2e"]})   # same commit
+        finally:
+            gj.run = real_run
+        gj.record("https://github.com/a/b/pull/88", "codex", "findings", {"round": 1, "findings": []})
+        gj.record("https://github.com/a/b/pull/88", "codex", "findings", {"round": 1, "findings": []})
+        gj.record("https://github.com/a/b/pull/88", "codex", "clean", {"round": 2})
+        gj.record("https://github.com/x/y/pull/1", "ci", "green")   # not tracked: ignored
+        self.assertEqual(self.kinds(eid), [
+            ("start", "plan"), ("stage", "verify"), ("stage", "build"), ("status", "blocked"),
+            ("status", "active"), ("stage", "review"), ("pr", "https://github.com/a/b/pull/88"), ("status", "review"), ("ci", "failed"),
+            ("codex", "findings"), ("codex", "clean")])
+        note = gj.db().execute("SELECT note FROM events WHERE effort_id = ? AND value = 'build'",
+                               (eid,)).fetchone()[0]
+        self.assertEqual(note, "test failed")   # kept, though the effort's note moved on
+
+    def test_correction(self):
+        for t in ("no, use the other table", "Don't push yet", "actually make it 60", "why did you skip it"):
+            self.assertTrue(gj.CORRECTION_RE.match(t), t)
+        for t in ("yeah do that", "now add a test", "nothing else", "notify me", "No problem, go ahead",
+                  "wait for CI then ship"):
+            self.assertFalse(gj.CORRECTION_RE.match(t), t)
+
+    def test_claude_scan(self):
+        d = Path(tempfile.mkdtemp())
+        log = d / "cs.jsonl"
+        u = {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 100,
+             "cache_creation_input_tokens": 20}
+        user = lambda ts, content, **kw: dict(type="user", timestamp=ts, message={"content": content}, **kw)
+        asst = lambda ts, mid: {"type": "assistant", "timestamp": ts, "message": {"id": mid, "usage": u}}
+        lines = [
+            user("2026-11-01T10:00:00Z", "build the thing"),
+            asst("2026-11-01T10:00:05Z", "m1"), asst("2026-11-01T10:00:06Z", "m1"),   # same message
+            user("2026-11-01T10:01:00Z", "<command-name>/clear</command-name>"),
+            user("2026-11-01T10:01:30Z", "<command-name>/review</command-name><command-args>the diff</command-args>"),
+            user("2026-11-01T10:02:00Z", [{"type": "tool_result", "is_error": True, "content": "boom"}]),
+            user("2026-11-01T12:00:00Z", "no, not like that"),
+            asst("2026-11-01T12:00:05Z", "m2"),
+            user("2026-11-01T12:01:00Z", [{"type": "tool_result", "content":
+                 "The user doesn't want to proceed with this tool use. To tell you how to proceed, "
+                 "the user said:\nuse the staging db"}]),
+            user("2026-11-01T12:02:00Z", [{"type": "text", "text": "[Request interrupted by user]"}]),
+            user("2026-11-01T12:02:30Z", [{"type": "tool_result", "content":
+                 "The user doesn't want to proceed with this tool use. the user said:\n"
+                 "The user wants to clarify these questions."}]),
+            user("2026-11-01T12:03:00Z", "summary", isCompactSummary=True),
+        ]
+        log.write_text("".join(json.dumps(l) + "\n" for l in lines))
+        sub = d / "cs" / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-1.jsonl").write_text(json.dumps(asst("2026-11-01T12:00:30Z", "s1")) + "\n"
+                                           + json.dumps(user("2026-11-01T12:00:31Z", "no subagent text")) + "\n")
+        conn = gj.db()
+        t = gj.parse_ts
+        a = conn.execute("INSERT INTO efforts(title, agent, session_id, created_at, updated_at) "
+                         "VALUES ('a', 'claude', 'cs', ?, 0)", (t("2026-11-01T10:00:30Z"),)).lastrowid
+        b = conn.execute("INSERT INTO efforts(title, agent, session_id, created_at, updated_at) "
+                         "VALUES ('b', 'claude', 'cs', ?, 0)", (t("2026-11-01T11:00:00Z"),)).lastrowid
+        # #1 attached at 11:30 owns what follows, though it was created long before
+        old = conn.execute("INSERT INTO efforts(title, agent, session_id, created_at, updated_at) "
+                           "VALUES ('old', 'claude', 'cs', 5, 0)").lastrowid
+        conn.execute("INSERT INTO events(effort_id, at, kind, value) VALUES (?, ?, 'attach', 'claude:cs')",
+                     (old, t("2026-11-01T12:02:10Z")))
+        for _ in range(2):   # a rescan replaces, never doubles
+            gj.scan_session(conn, "claude", "cs", gj.claude_items(log))
+        use = {r["effort_id"]: dict(r) for r in conn.execute("SELECT * FROM usage WHERE session = 'claude:cs'")}
+        self.assertEqual((use[a]["input"], use[a]["tool_errors"]), (10, 1))   # talk before start counts
+        self.assertEqual((use[b]["input"], use[b]["cache_read"], use[b]["rejections"], use[b]["interrupts"]),
+                         (20, 200, 1, 1))
+        said = [(r["effort_id"], r["text"], r["correction"]) for r in conn.execute(
+            "SELECT * FROM said WHERE session = 'claude:cs' ORDER BY at")]
+        self.assertEqual(said, [(a, "build the thing", 0), (a, "the diff", 0), (b, "no, not like that", 1),
+                                (b, "(refused a tool call) use the staging db", 1)])
+
+    def test_codex_tokens(self):
+        log = Path(tempfile.mkdtemp()) / "r.jsonl"
+        tc = lambda ts, i, c, o: {"type": "event_msg", "timestamp": ts, "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": i, "cached_input_tokens": c, "output_tokens": o}}}}
+        lines = [tc("2026-11-01T10:00:00Z", 100, 40, 10),
+                 {"type": "event_msg", "timestamp": "2026-11-01T10:01:00Z",
+                  "payload": {"type": "user_message", "message": "stop, wrong repo"}},
+                 tc("2026-11-01T10:02:00Z", 300, 140, 30)]
+        log.write_text("".join(json.dumps(l) + "\n" for l in lines))
+        toks = [v for _, k, v in gj.codex_items(log) if k == "tokens"]
+        self.assertEqual(toks, [{"input": 60, "output": 10, "cache_read": 40, "cache_write": 0},
+                                {"input": 100, "output": 20, "cache_read": 100, "cache_write": 0}])

@@ -78,6 +78,41 @@ CREATE TABLE IF NOT EXISTS summaries (
     created_at  REAL NOT NULL,
     PRIMARY KEY (kind, day)
 );
+CREATE TABLE IF NOT EXISTS events (     -- append-only history of each effort, for retros
+    id          INTEGER PRIMARY KEY,
+    effort_id   INTEGER NOT NULL REFERENCES efforts(id) ON DELETE CASCADE,
+    at          REAL NOT NULL,
+    kind        TEXT NOT NULL,   -- start / attach / stage / status / note / pr / codex / ci
+    value       TEXT NOT NULL DEFAULT '',
+    note        TEXT NOT NULL DEFAULT '',
+    data        TEXT NOT NULL DEFAULT ''   -- JSON: Codex findings, failed checks
+);
+CREATE INDEX IF NOT EXISTS events_effort ON events(effort_id, at);
+CREATE TABLE IF NOT EXISTS usage (      -- read from the agent's transcript, per effort and session
+    effort_id   INTEGER NOT NULL REFERENCES efforts(id) ON DELETE CASCADE,
+    session     TEXT NOT NULL,   -- agent:session_id
+    input       INTEGER NOT NULL DEFAULT 0,   -- uncached input tokens
+    output      INTEGER NOT NULL DEFAULT 0,
+    cache_read  INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0,
+    tool_errors INTEGER NOT NULL DEFAULT 0,
+    interrupts  INTEGER NOT NULL DEFAULT 0,
+    rejections  INTEGER NOT NULL DEFAULT 0,   -- tool calls the human refused
+    PRIMARY KEY (effort_id, session)
+);
+CREATE TABLE IF NOT EXISTS said (       -- what the human typed to the agent
+    effort_id   INTEGER NOT NULL REFERENCES efforts(id) ON DELETE CASCADE,
+    session     TEXT NOT NULL,
+    at          REAL NOT NULL,
+    text        TEXT NOT NULL,
+    correction  INTEGER NOT NULL DEFAULT 0   -- looks like pushback: "no", "don't", a refused tool call
+);
+CREATE INDEX IF NOT EXISTS said_effort ON said(effort_id, at);
+CREATE TABLE IF NOT EXISTS scans (      -- transcripts already read, by their mtime
+    session     TEXT PRIMARY KEY,
+    mtime       REAL NOT NULL,
+    scanned_at  REAL NOT NULL
+);
 """
 
 
@@ -295,6 +330,11 @@ def touch(conn, eid, **fields):
     conn.execute("UPDATE efforts SET %s WHERE id = ?" % sets, (*fields.values(), eid))
 
 
+def log_event(conn, eid, kind, value="", note="", data=None):
+    conn.execute("INSERT INTO events(effort_id, at, kind, value, note, data) VALUES (?, ?, ?, ?, ?, ?)",
+                 (eid, now(), kind, value or "", note or "", json.dumps(data) if data else ""))
+
+
 def add_pr(conn, eid, url):
     m = PR_RE.search(url)
     if not m:
@@ -333,15 +373,23 @@ def cmd_start(args):
         if args.title:
             fields["title"] = args.title
         if args.id:   # this session now carries the effort: resume points here
+            if existing["session_id"] and (existing["agent"], existing["session_id"]) != (agent, sid):
+                try:   # read the session it leaves first: after this no effort points at it
+                    scan_transcripts(conn, force=True, only=(existing["agent"], existing["session_id"]))
+                except Exception:
+                    pass
             fields.update(agent=agent, session_id=sid)
             if existing["status"] in ("done", "dropped"):
                 fields["status"] = "active"
+                log_event(conn, eid, "status", "active", "attached")
         if args.prompt:
             fields["prompt"] = args.prompt
         if args.epic:
             fields["epic"] = args.epic
         touch(conn, eid, **fields)
         verb = "attached to" if args.id else "updated"
+        if args.id:
+            log_event(conn, eid, "attach", "%s:%s" % (agent, sid))
     else:
         t = now()
         eid = conn.execute(
@@ -350,6 +398,7 @@ def cmd_start(args):
             (args.title, prompt, args.epic or "", agent, sid, cwd, repo, branch, "plan",
              t, t, t)).lastrowid
         verb = "started"
+        log_event(conn, eid, "start", "plan", args.title)
     for url in args.pr or []:
         add_pr(conn, eid, url)
     conn.commit()
@@ -361,9 +410,13 @@ def cmd_pr(args):
     conn = db()
     e = current_effort(conn, args)
     urls = [add_pr(conn, e["id"], u) for u in args.urls]
+    for u in urls:
+        log_event(conn, e["id"], "pr", u)
     repo, branch = git_info(e["cwd"]) if e["cwd"] and os.path.isdir(e["cwd"]) else ("", "")
     # A new PR reopens a closed effort: a long effort's next piece.
     fields = {"status": "review"} if e["status"] in ("active", "done", "dropped") else {}
+    if fields:
+        log_event(conn, e["id"], "status", "review", "linked a PR")
     if branch:
         fields.update(branch=branch, repo=repo or e["repo"])
     touch(conn, e["id"], **fields)
@@ -379,6 +432,7 @@ def cmd_status(args):
     if args.note is not None:
         fields["note"] = args.note
     touch(conn, e["id"], **fields)
+    log_event(conn, e["id"], "status", args.status, args.note)
     conn.commit()
     print("gj: #%d -> %s" % (e["id"], args.status))
 
@@ -391,7 +445,9 @@ def cmd_stage(args):
         fields["note"] = args.note
     if e["status"] in ("blocked", "done", "dropped"):
         fields["status"] = "active"
+        log_event(conn, e["id"], "status", "active", "reported a stage")
     touch(conn, e["id"], **fields)
+    log_event(conn, e["id"], "stage", args.stage, args.note)
     conn.commit()
     print("gj: #%d stage -> %s" % (e["id"], args.stage))
 
@@ -425,6 +481,7 @@ def cmd_note(args):
     conn = db()
     e = current_effort(conn, args)
     touch(conn, e["id"], note=" ".join(args.text))
+    log_event(conn, e["id"], "note", "", " ".join(args.text))
     conn.commit()
     print("gj: #%d noted" % e["id"])
 
@@ -538,6 +595,7 @@ def auto_close(conn):
         if r["n"] and r["shut"] == r["n"]:
             status = "done" if r["merged"] else "dropped"
             touch(conn, r["id"], status=status)
+            log_event(conn, r["id"], "status", status, "auto: all its PRs closed")
             closed.append((r["id"], status))
     conn.commit()
     return closed
@@ -952,17 +1010,46 @@ def codex_state(comments, reviews, reactions=()):
     return asked, sorted(receipts, key=lambda r: r["at"])
 
 
-def codex_finding(c):
-    """One inline Codex comment as plain text: [P1] path:line, then the body without badges."""
+def codex_parts(c):
+    """An inline Codex comment as {prio, path, line, text}, the text without badges."""
     body = c.get("body") or ""
     prio = re.search(r"!\[(P\d) Badge\]", body)
     body = re.sub(r"<sub>|</sub>|!\[[^\]]*\]\([^)]*\)", "", body)
     body = re.sub(r"Useful\? React with .*|<!--.*?-->", "", body)
     body = re.sub(r"^\s*\*\*\s*(.+?)\*\*", r"\1:", body, count=1)   # the bold title line
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
-    line = c.get("line") or c.get("original_line")   # none when it's about the whole file
-    return "- %s%s%s\n  %s" % ("[%s] " % prio.group(1) if prio else "", c.get("path"),
-                               ":%s" % line if line else "", clip(body, 1200).replace("\n", "\n  "))
+    return {"prio": prio.group(1) if prio else "", "path": c.get("path") or "",
+            "line": c.get("line") or c.get("original_line"),   # none when it's about the whole file
+            "text": body}
+
+
+def codex_finding(c):
+    """One inline Codex comment as plain text: [P1] path:line, then the body."""
+    f = codex_parts(c)
+    return "- %s%s%s\n  %s" % ("[%s] " % f["prio"] if f["prio"] else "", f["path"],
+                               ":%s" % f["line"] if f["line"] else "", clip(f["text"], 1200).replace("\n", "\n  "))
+
+
+def record(url, kind, value, data=None):
+    """Log a wait's outcome on the PR's effort. Best effort: history must never break the wait."""
+    try:
+        m = PR_RE.search(url)
+        conn = db()
+        row = conn.execute("SELECT effort_id FROM prs WHERE url = ?",
+                           ("https://github.com/%s/pull/%s" % (m.group(1), m.group(2)),)).fetchone()
+        if kind == "ci" and data is not None:   # one result per commit
+            data["sha"] = run(["gh", "pr", "view", url, "--json", "headRefOid", "--jq", ".headRefOid"]) or ""
+        same = ("round",) if kind == "codex" else ("sha",)
+        dup = row and data and all(data.get(k) for k in same) and any(
+            json.loads(v["data"] or "{}").get(same[0]) == data[same[0]]
+            for v in conn.execute("SELECT data FROM events WHERE effort_id = ? AND kind = ? AND value = ? "
+                                  "AND note = ?", (row["effort_id"], kind, value, url)))
+        if row and not dup:
+            log_event(conn, row["effort_id"], kind, value, url, data)
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 def effort_pr(args):
@@ -1006,9 +1093,12 @@ def cmd_codex_wait(args):
                 rounds = sum(1 for x in receipts if not x["clean"])
                 n = receipts.index(r) + 1
                 if r["clean"]:
+                    record(url, "codex", "clean", {"round": n})
                     print("Codex review %d on %s: no major issues. The loop is done." % (n, url))
                     return
                 found = gh_items("repos/%s/pulls/%s/reviews/%s/comments" % (repo, num, r["id"])) or []
+                record(url, "codex", "findings", {"round": n, "findings": [
+                    dict(codex_parts(c), text=clip(codex_parts(c)["text"], 600)) for c in found]})
                 print("Codex review %d on %s: %d finding(s). Rounds with findings: %d of %d.\n"
                       % (n, url, len(found), rounds, CODEX_ROUNDS))
                 print("\n".join(codex_finding(c) for c in found) or "(no inline comments; see the PR)")
@@ -1020,6 +1110,7 @@ def cmd_codex_wait(args):
             print("gj: %s is %s; nothing to wait for." % (url, gone))
             sys.exit(3)
         if now() > deadline:
+            record(url, "codex", "timeout")
             print("gj: no Codex review on %s after %d min. Tell the user; don't keep waiting." % (url, args.timeout))
             sys.exit(2)
         time.sleep(args.interval)
@@ -1095,12 +1186,17 @@ def cmd_ci_wait(args):
             done, green, text = ci_report(checks)
             if done:
                 print(text)
+                waited = round((now() - start) / 60, 1)
                 if green:
+                    record(url, "ci", "green", {"minutes": waited, "checks": [c["name"] for c in checks]})
                     return
                 runs = sorted({m.group(1) for m in (JOB_RE.search(c["link"] or "") for c in checks
                                                     if c["bucket"] == "fail") if m})
                 gates = {c["name"] for c in checks if c["bucket"] == "fail"}
-                for name, link in failed_jobs(repo, runs, gates)[:3]:
+                jobs = failed_jobs(repo, runs, gates)
+                record(url, "ci", "failed", {"minutes": waited, "jobs": [j[0] for j in jobs], "checks": [
+                    c["name"] for c in checks if c["bucket"] in ("fail", "cancel")]})
+                for name, link in jobs[:3]:
                     print("\n--- %s (%s), end of its failed log:\n%s" % (name, link, failed_log(repo, link)))
                 if runs:
                     print("\nIf a failure is unrelated to this change, rerun it once: "
@@ -1111,10 +1207,227 @@ def cmd_ci_wait(args):
             print("gj: %s is %s; nothing to wait for." % (url, gone))
             sys.exit(3)
         if now() > start + args.timeout * 60:
+            record(url, "ci", "timeout")
             print("gj: required checks on %s still running after %d min. Tell the user; don't keep waiting."
                   % (url, args.timeout))
             sys.exit(2)
         time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------- transcript signals
+
+# The start of a message that pushes back on what the agent did.
+CORRECTION_RE = re.compile(
+    r"^\W*(?!no (problem|worries|need|rush)\b|wait (for|until|till|on)\b|stop (by|at)\b)(no\b|nope\b|nah\b|don'?t\b|do not\b|stop\b|wait\b|actually\b|undo\b|revert\b|wrong\b|"
+    r"hold on\b|instead\b|not what\b|that'?s (not|wrong)\b|that is not\b|why (did|are|is|would) you\b|"
+    r"you (didn'?t|forgot|missed|broke|should(n'?t)?)\b)", re.I)
+SETTLE_SECS = 600   # scan a transcript once it has been quiet this long
+
+
+def jsonl(path):
+    """The JSON objects in a log file, skipping lines that don't parse."""
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict):
+                yield d
+
+
+def _tokens(**kw):
+    return {k: int(v or 0) for k, v in kw.items()}
+
+
+def claude_items(path):
+    """[(ts, kind, value)] from a Claude transcript and its subagents' (tokens only)."""
+    items, usage = [], {}
+    logs = [path] + sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
+    for i, p in enumerate(logs):
+        for d in jsonl(p):
+            ts = parse_ts(d.get("timestamp"))
+            m = d.get("message") or {}
+            if d.get("type") == "assistant" and m.get("usage"):
+                u = m["usage"]   # a message is logged once per content block: keep its last usage
+                usage[(i, m.get("id"))] = (ts, "tokens", _tokens(
+                    input=u.get("input_tokens"), output=u.get("output_tokens"),
+                    cache_read=u.get("cache_read_input_tokens"),
+                    cache_write=u.get("cache_creation_input_tokens")))
+            if d.get("type") != "user" or i or d.get("isMeta") or d.get("isCompactSummary"):
+                continue
+            c = m.get("content")
+            for b in [{"type": "text", "text": c}] if isinstance(c, str) else c or []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_result":
+                    out = b.get("content")
+                    if isinstance(out, list):
+                        out = " ".join(x.get("text", "") for x in out if isinstance(x, dict))
+                    out = out or ""
+                    if "doesn't want to proceed with this tool use" in out:
+                        said = re.search(r"the user said:\n(.*)", out, re.S)
+                        said = said.group(1).strip() if said else ""
+                        if not said.startswith("The user wants to clarify"):   # a question's option
+                            items.append((ts, "reject", said))
+                    elif b.get("is_error"):
+                        items.append((ts, "tool_error", None))
+                elif b.get("type") == "text":
+                    t = (b.get("text") or "").strip()
+                    if t.startswith("[Request interrupted by user"):
+                        items.append((ts, "interrupt", None))
+                    elif t.startswith("<command-name>"):   # a slash command: keep what was typed after it
+                        a = re.search(r"<command-args>(.*?)</command-args>", t, re.S)
+                        if a and a.group(1).strip():
+                            items.append((ts, "said", a.group(1).strip()))
+                    elif t and not t.startswith(("<", "Caveat:")):   # not tool output or ! shells
+                        items.append((ts, "said", t))
+    return items + list(usage.values())
+
+
+def codex_items(path):
+    items, prev = [], {}
+    for d in jsonl(path):
+        p = d.get("payload") or {}
+        if d.get("type") != "event_msg":
+            continue
+        ts = parse_ts(d.get("timestamp"))
+        if p.get("type") == "token_count":
+            t = (p.get("info") or {}).get("total_token_usage")
+            if t:   # cumulative for the session; cached input is part of input
+                cur = _tokens(input=(t.get("input_tokens") or 0) - (t.get("cached_input_tokens") or 0),
+                              output=t.get("output_tokens"), cache_read=t.get("cached_input_tokens"),
+                              cache_write=t.get("cache_write_input_tokens"))
+                items.append((ts, "tokens", {k: max(0, v - prev.get(k, 0)) for k, v in cur.items()}))
+                prev = cur
+        elif p.get("type") == "user_message" and (p.get("message") or "").strip():
+            items.append((ts, "said", p["message"].strip()))
+        elif p.get("type") == "turn_aborted" and p.get("reason") == "interrupted":
+            items.append((ts, "interrupt", None))
+    return items
+
+
+def grok_items(path):
+    """Grok's log has no timestamps, so its items go to the session's newest effort."""
+    items = []
+    for d in jsonl(path):
+        if d.get("type") == "user":
+            text = " ".join(x.get("text", "") for x in d.get("content") or [] if isinstance(x, dict))
+            q = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
+            if q:
+                items.append((None, "said", q.group(1).strip()))
+    try:
+        u = json.loads((path.parent / "usage.json").read_text()).get("session") or {}
+        items.append((None, "tokens", _tokens(
+            input=(u.get("inputTokens") or 0) - (u.get("cachedReadTokens") or 0), output=u.get("outputTokens"),
+            cache_read=u.get("cachedReadTokens"), cache_write=u.get("cacheCreationTokens"))))
+    except (OSError, ValueError):
+        pass
+    return items
+
+
+def log_mtime(agent, path):
+    more = []
+    if agent == "claude":
+        more = (path.parent / path.stem / "subagents").glob("*.jsonl")
+    elif agent == "grok":
+        more = [path.parent / "usage.json"]
+    return max([path.stat().st_mtime] + [p.stat().st_mtime for p in more if p.exists()])
+
+
+def scan_session(conn, agent, sid, items):
+    """Replace this session's usage and said rows. Each item goes to the session's effort that was
+    registered last before it; anything earlier (the talk before `gj start`) goes to the first."""
+    key = "%s:%s" % (agent, sid)
+    # an effort attached with `gj start --id` owns the session from the attach on
+    efforts = conn.execute(
+        "SELECT e.id, COALESCE((SELECT MAX(at) FROM events v WHERE v.effort_id = e.id AND v.kind = 'attach' "
+        "AND v.value = ?), e.created_at) created_at FROM efforts e WHERE agent = ? AND session_id = ? "
+        "ORDER BY created_at, id", (key, agent, sid)).fetchall()
+    if not efforts:
+        return
+
+    def owner(ts):
+        if not ts:
+            return efforts[-1]["id"]
+        return ([e["id"] for e in efforts if e["created_at"] <= ts] or [efforts[0]["id"]])[-1]
+    conn.execute("DELETE FROM usage WHERE session = ?", (key,))
+    conn.execute("DELETE FROM said WHERE session = ?", (key,))
+    acc = {}
+    for ts, kind, v in items:
+        eid = owner(ts)
+        a = acc.setdefault(eid, dict.fromkeys(("input", "output", "cache_read", "cache_write",
+                                               "tool_errors", "interrupts", "rejections"), 0))
+        if kind == "tokens":
+            for k, n in v.items():
+                a[k] += n
+        elif kind == "said" or (kind == "reject" and v):
+            text = v if kind == "said" else "(refused a tool call) " + v
+            conn.execute("INSERT INTO said(effort_id, session, at, text, correction) VALUES (?, ?, ?, ?, ?)",
+                         (eid, key, ts or efforts[-1]["created_at"], text[:2000],
+                          int(kind == "reject" or bool(CORRECTION_RE.match(v)))))
+        if kind in ("tool_error", "interrupt", "reject"):
+            a[{"reject": "rejections"}.get(kind, kind + "s")] += 1
+    for eid, a in acc.items():
+        conn.execute("INSERT INTO usage(effort_id, session, %s) VALUES (?, ?, %s)"
+                     % (", ".join(a), ", ".join("?" * len(a))), (eid, key, *a.values()))
+
+
+def scan_transcripts(conn, force=False, only=None):
+    """Read the transcripts of tracked sessions that changed since the last scan and have gone
+    quiet. Plain parsing, no model calls. Returns how many were read."""
+    n = 0
+    for r in conn.execute("SELECT agent, session_id, MAX(cwd) cwd FROM efforts WHERE session_id != '' "
+                          "GROUP BY agent, session_id").fetchall():
+        if only and (r["agent"], r["session_id"]) != only:
+            continue
+        p = session_log(dict(r))
+        if not p:
+            continue   # gone: the agent cleaned it up. What was scanned stays.
+        try:
+            mt = log_mtime(r["agent"], p)
+            key = "%s:%s" % (r["agent"], r["session_id"])
+            row = conn.execute("SELECT mtime FROM scans WHERE session = ?", (key,)).fetchone()
+            if (row and row["mtime"] >= mt) or (not force and now() - mt < SETTLE_SECS):
+                continue
+            items = {"claude": claude_items, "codex": codex_items, "grok": grok_items}[r["agent"]](p)
+        except Exception as ex:   # one odd transcript must not stop the rest; it is retried next pass
+            print("gj: couldn't read %s: %s" % (p, ex), file=sys.stderr)
+            continue
+        scan_session(conn, r["agent"], r["session_id"], items)
+        conn.execute("INSERT OR REPLACE INTO scans(session, mtime, scanned_at) VALUES (?, ?, ?)",
+                     (key, mt, now()))
+        conn.commit()
+        n += 1
+    return n
+
+
+def cmd_scan(args):
+    conn = db()
+    print("gj: read %d transcript(s)" % scan_transcripts(conn, force=args.force))
+
+
+def cmd_history(args):
+    conn = db()
+    e = current_effort(conn, args)
+    print("#%d %s" % (e["id"], e["title"]))
+    for r in conn.execute("SELECT * FROM events WHERE effort_id = ? ORDER BY at, id", (e["id"],)):
+        when = datetime.fromtimestamp(r["at"]).strftime("%m-%d %H:%M")
+        extra = ""
+        if r["data"]:
+            d = json.loads(r["data"])
+            extra = "  " + ", ".join("%s=%s" % (k, len(v) if isinstance(v, list) and k == "findings" else v)
+                                     for k, v in d.items())
+        print("  %s  %-6s %-9s %s%s" % (when, r["kind"], r["value"], clip(r["note"], 70), extra))
+    u = conn.execute("SELECT SUM(input) i, SUM(output) o, SUM(cache_read) cr, SUM(cache_write) cw, "
+                     "SUM(tool_errors) te, SUM(interrupts) it, SUM(rejections) rj FROM usage "
+                     "WHERE effort_id = ?", (e["id"],)).fetchone()
+    if u["i"] is not None:
+        print("  tokens: %s in, %s out, %s cache read, %s cache write" % tuple(
+            format(u[k], ",") for k in ("i", "o", "cr", "cw")))
+        print("  tool errors %d, interrupts %d, refused tool calls %d" % (u["te"], u["it"], u["rj"]))
+    for r in conn.execute("SELECT * FROM said WHERE effort_id = ? AND correction ORDER BY at", (e["id"],)):
+        print("  pushback: %s" % clip(r["text"], 150))
 
 
 # ---------------------------------------------------------------- summaries
@@ -1748,10 +2061,13 @@ class Handler(BaseHTTPRequestHandler):
             eid = int(body["id"])
             if self.path == "/api/status" and body.get("status") in STATUSES:
                 touch(conn, eid, status=body["status"])
+                log_event(conn, eid, "status", body["status"], "from the dashboard")
             elif self.path == "/api/note":
                 touch(conn, eid, note=str(body.get("note", "")))
+                log_event(conn, eid, "note", "", str(body.get("note", "")))
             elif self.path == "/api/pr":
                 url = add_pr_checked(conn, eid, str(body.get("url", "")))
+                log_event(conn, eid, "pr", url)
                 sync_prs(conn, [url])
             else:
                 return self.send(400, '{"error":"bad request"}')
@@ -1772,10 +2088,13 @@ def cmd_serve(args):
     if not args.no_sync:
         def loop():
             while True:
-                try:
-                    sync_all(db())
-                except Exception as ex:  # keep the dashboard up if gh hiccups
-                    print("gj: sync failed: %s" % ex, file=sys.stderr)
+                c = db()
+                for step in (sync_all, scan_transcripts):
+                    try:
+                        step(c)
+                    except Exception as ex:  # keep the dashboard up if gh hiccups
+                        print("gj: %s failed: %s" % (step.__name__, ex), file=sys.stderr)
+                c.close()
                 time.sleep(args.interval * 60)
         threading.Thread(target=loop, daemon=True).start()
     conn.close()
@@ -2020,6 +2339,14 @@ def main(argv=None):
     p.add_argument("kind", choices=sorted(SUMMARY_PROMPTS))
     p.add_argument("--digest", action="store_true", help="print the input instead of calling Claude")
     p.set_defaults(fn=cmd_summary)
+
+    p = sub.add_parser("history", help="an effort's stage history, Codex and CI rounds, tokens, pushback")
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_history)
+
+    p = sub.add_parser("scan", help="read agent transcripts into tokens and pushback (no model calls)")
+    p.add_argument("--force", action="store_true", help="also read sessions still being written")
+    p.set_defaults(fn=cmd_scan)
 
     p = sub.add_parser("note", help="set the effort's note")
     p.add_argument("text", nargs="+")

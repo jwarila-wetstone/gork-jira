@@ -67,6 +67,24 @@ both.
   runs at most once a day; later clicks show that day's copy. Weekly covers the last 7 days
   and runs again whenever you click **Run again**. The calls go through `claude -p` with no
   tools and no settings, so they use your Claude Code login and need no API key.
+- **History, for retros.** gj keeps an append-only record of each effort, which
+  `gj history` prints:
+  - every stage, status, and note change, so time per stage, trips back to `build`, and block
+    reasons survive later updates;
+  - each Codex round (its findings, with file, line, and priority) and each CI result (the
+    failed jobs and how long it waited).
+
+  It also reads the agents' transcripts with plain parsing and no model calls. The dashboard
+  service does this every 10 minutes for sessions that have been quiet for 10 minutes, and
+  `gj scan` does it on demand. From each transcript it keeps:
+  - tokens per effort;
+  - tool errors, interrupts, and refused tool calls;
+  - what you typed, flagged when it looks like pushback ("no", "don't", "actually", a refused
+    tool call with feedback).
+
+  The data stays in the local DB. Claude Code deletes transcripts after 30 days by default, so
+  set `"cleanupPeriodDays": 365` in `~/.claude/settings.json` to keep them for digging into
+  later.
 
 ## CLI
 
@@ -81,6 +99,8 @@ gj service install|uninstall|status [--port 7777] [--open]
 gj codex-wait [PR] [--request] [--timeout 40]   # wait for Codex's next review and print it
 gj ci-wait [PR] [--timeout 60]                 # wait for required checks; print failures and logs
 gj summary daily|weekly [--digest]   # --digest prints Claude's input without calling it
+gj history [--id N]                  # stages, Codex/CI rounds, tokens, and pushback for an effort
+gj scan [--force]                    # read transcripts now (--force: even sessions still running)
 ```
 
 Commands with no `--id` act on the effort registered by the calling agent session.
