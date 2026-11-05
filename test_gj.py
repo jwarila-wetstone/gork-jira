@@ -331,6 +331,19 @@ class Codex(unittest.TestCase):
         asked, receipts = gj.codex_state(comments, reviews)
         self.assertEqual([r for r in receipts if r["at"] > asked], [])
 
+    def test_thumbs_up_is_clean(self):
+        bot = {"login": "chatgpt-codex-connector[bot]"}
+        reactions = [{"content": "+1", "created_at": "2026-11-04T23:51:00Z", "user": bot},
+                     {"content": "eyes", "created_at": "2026-11-04T23:49:00Z", "user": bot},
+                     {"content": "+1", "created_at": "2026-11-04T23:52:00Z", "user": {"login": "someone"}}]
+        asked, receipts = gj.codex_state([], [], reactions)
+        self.assertEqual([(r["at"], r["clean"]) for r in receipts],
+                         [(gj.parse_ts("2026-11-04T23:51:00Z"), True)])
+        # a 👍 from an earlier round doesn't answer a later request
+        ask = [{"created_at": "2026-11-05T00:10:00Z", "body": "@codex review"}]
+        asked, receipts = gj.codex_state(ask, [], reactions)
+        self.assertEqual([r for r in receipts if r["at"] > asked], [])
+
     def test_finding(self):
         body = ("**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange)</sub></sub>  Move the note**\n\n"
                 "It belongs in the README.\n\nUseful? React with 👍 / 👎.\n<!-- codex-code-review-finding:v1 -->")

@@ -931,9 +931,10 @@ def gh_items(path):
     return [json.loads(line) for line in out.splitlines() if line.strip()]
 
 
-def codex_state(comments, reviews):
-    """(time of the latest `@codex review` request or 0, Codex's receipts oldest first).
-    Findings come as a PR review, a clean pass as an issue comment; both carry the receipt marker."""
+def codex_state(comments, reviews, reactions=()):
+    """(time of the latest `@codex review` request or 0, Codex's results oldest first).
+    Findings come as a PR review and a requested clean pass as an issue comment, both carrying the
+    receipt marker. A clean first review is only a 👍 from Codex on the PR itself."""
     asked = max([parse_ts(c["created_at"]) for c in comments
                  if re.match(r"\s*@codex review\b", c.get("body") or "")] or [0])
     receipts = [{"at": parse_ts(c["created_at"]), "id": None, "body": c["body"],
@@ -941,6 +942,9 @@ def codex_state(comments, reviews):
                 for c in comments if CODEX_RECEIPT in (c.get("body") or "")]
     receipts += [{"at": parse_ts(r["submitted_at"]), "id": r["id"], "body": r["body"], "clean": False}
                  for r in reviews if CODEX_RECEIPT in (r.get("body") or "") and r.get("submitted_at")]
+    receipts += [{"at": parse_ts(r["created_at"]), "id": None, "body": "", "clean": True}
+                 for r in reactions if r.get("content") == "+1"
+                 and "codex" in ((r.get("user") or {}).get("login") or "")]
     return asked, sorted(receipts, key=lambda r: r["at"])
 
 
@@ -952,9 +956,9 @@ def codex_finding(c):
     body = re.sub(r"Useful\? React with .*|<!--.*?-->", "", body)
     body = re.sub(r"^\s*\*\*\s*(.+?)\*\*", r"\1:", body, count=1)   # the bold title line
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
-    return "- %s%s:%s\n  %s" % ("[%s] " % prio.group(1) if prio else "", c.get("path"),
-                                 c.get("line") or c.get("original_line") or "?",
-                                 clip(body, 1200).replace("\n", "\n  "))
+    line = c.get("line") or c.get("original_line")   # none when it's about the whole file
+    return "- %s%s%s\n  %s" % ("[%s] " % prio.group(1) if prio else "", c.get("path"),
+                               ":%s" % line if line else "", clip(body, 1200).replace("\n", "\n  "))
 
 
 def cmd_codex_wait(args):
@@ -979,8 +983,9 @@ def cmd_codex_wait(args):
     while True:
         comments = gh_items("repos/%s/issues/%s/comments" % (repo, num))
         reviews = gh_items("repos/%s/pulls/%s/reviews" % (repo, num))
-        if comments is not None and reviews is not None:
-            asked, receipts = codex_state(comments, reviews)
+        reactions = gh_items("repos/%s/issues/%s/reactions" % (repo, num))
+        if None not in (comments, reviews, reactions):
+            asked, receipts = codex_state(comments, reviews, reactions)
             new = [r for r in receipts if r["at"] > asked]
             if new:
                 r = new[-1]
