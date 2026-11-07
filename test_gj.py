@@ -216,6 +216,26 @@ class Live(unittest.TestCase):
             f.write('"}\n')
         self.assertEqual(gj.liveness(e)["state"], "done")
 
+    def test_merge_watch_pattern(self):
+        self.assertTrue(gj.MERGE_WATCH.fullmatch("gj merge-wait --timeout 60"))
+        self.assertTrue(gj.MERGE_WATCH.fullmatch("/Users/x/bin/gj merge-wait"))
+        self.assertFalse(gj.MERGE_WATCH.fullmatch("gj ci-wait && gj merge-wait"))
+
+    def test_merge_watch_is_not_working(self):
+        log = Path(tempfile.mkdtemp()) / "mw.jsonl"
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        lines = [
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash",
+             "input": {"command": "gj merge-wait", "description": "Watch the PR", "run_in_background": True}}]}},
+            {"type": "user", "timestamp": ts, "toolUseResult": {"backgroundTaskId": "m1"},
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "tu1", "content": "running"}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "Watching for the merge."}]}},
+        ]
+        log.write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in lines))
+        os.utime(log, (time.time() - 600, time.time() - 600))
+        gj._log_paths[("claude", "mw")] = log
+        self.assertEqual(gj.liveness(effort(agent="claude", session_id="mw"))["state"], "done")
+
 
 class Stages(unittest.TestCase):
     def test_stage_from_github(self):
@@ -589,3 +609,102 @@ class History(unittest.TestCase):
         toks = [v for _, k, v in gj.codex_items(log) if k == "tokens"]
         self.assertEqual(toks, [{"input": 60, "output": 10, "cache_read": 40, "cache_write": 0},
                                 {"input": 100, "output": 20, "cache_read": 100, "cache_write": 0}])
+
+
+class MergeWait(unittest.TestCase):
+    URL = "https://github.com/a/b/pull/5"
+
+    def watch(self, views, reviews=(), comments=(), checks=None):
+        import io, contextlib
+        views = list(views)
+        real = gj.run, gj.gh_items, gj.required_checks, gj.time.sleep
+
+        def run(cmd, **k):
+            if cmd[:3] == ["gh", "pr", "view"] and "--jq" not in cmd:
+                return json.dumps(views.pop(0) if len(views) > 1 else views[0])
+            return "sha1"
+        gj.run = run
+        gj.gh_items = lambda p: ([{"path": "x.py", "line": 3, "body": "rename this"}] if "/reviews/2/" in p
+                                 else [] if "/reviews/" in p
+                                 else list(reviews) if p.endswith("/reviews") else list(comments))
+        gj.required_checks = lambda url: checks
+        gj.time.sleep = lambda s: None
+        out, code = io.StringIO(), 0
+        try:
+            with contextlib.redirect_stdout(out):
+                gj.cmd_merge_wait(type("A", (), dict(pr=self.URL, timeout=60, interval=0, id=None)))
+        except SystemExit as ex:
+            code = ex.code
+        finally:
+            gj.run, gj.gh_items, gj.required_checks, gj.time.sleep = real
+        return code, out.getvalue()
+
+    def view(self, **kw):
+        v = dict(state="OPEN", reviewDecision="REVIEW_REQUIRED", mergeable="MERGEABLE", headRefOid="h1",
+                 author={"login": "me"}, mergedBy=None, latestReviews=[])
+        v.update(kw)
+        return v
+
+    def test_waits_through_approval_to_merge(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, created_at, updated_at) VALUES ('m', 0, 0)").lastrowid
+        gj.add_pr(conn, eid, self.URL)
+        conn.commit()
+        mine = {"user": {"login": "me", "type": "User"}, "state": "COMMENTED", "id": 1,
+                "submitted_at": "2026-11-01T00:00:00Z", "body": "replying to Codex"}
+        code, out = self.watch([
+            self.view(),
+            self.view(reviewDecision="APPROVED", latestReviews=[{"state": "APPROVED", "author": {"login": "dana"}}]),
+            self.view(reviewDecision="APPROVED"),
+            self.view(state="MERGED", mergedBy={"login": "dana"})], reviews=[mine])
+        self.assertEqual(code, 0)
+        self.assertIn("approved by dana; waiting", out)
+        self.assertIn("merged (by dana)", out)
+        kinds = [(r["kind"], r["value"]) for r in conn.execute(
+            "SELECT kind, value FROM events WHERE effort_id = ? ORDER BY id", (eid,))]
+        self.assertEqual(kinds, [("merge", "approved"), ("merge", "merged")])
+
+    def test_feedback_wakes_once(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, created_at, updated_at) VALUES ('f', 0, 0)").lastrowid
+        gj.add_pr(conn, eid, self.URL)
+        conn.commit()
+        theirs = {"user": {"login": "dana", "type": "User"}, "state": "COMMENTED", "id": 2,
+                  "submitted_at": "2026-11-02T00:00:00Z", "body": "a few nits"}
+        bot = {"user": {"login": "codex[bot]", "type": "Bot"}, "created_at": "2026-11-02T00:00:00Z", "body": "x"}
+        ask = {"user": {"login": "me", "type": "User"}, "created_at": "2026-11-02T00:00:00Z", "body": "@codex review"}
+        lgtm = {"user": {"login": "sam", "type": "User"}, "state": "APPROVED", "id": 3,
+                "submitted_at": "2026-11-02T00:00:00Z", "body": ""}
+        code, out = self.watch([self.view()], reviews=[theirs, lgtm], comments=[bot, ask])
+        self.assertEqual(code, 1)
+        self.assertIn("dana commented:\n  a few nits\n- x.py:3\n  rename this", out)
+        self.assertNotIn("codex[bot]", out)
+        self.assertNotIn("@codex", out)
+        self.assertNotIn("sam", out)   # a bare approval is not feedback
+        # the same feedback doesn't wake the agent again; a new comment does
+        code, out = self.watch([self.view(), self.view(state="MERGED")], reviews=[theirs])
+        self.assertEqual(code, 0)
+        later = {"user": {"login": "me", "type": "User"}, "created_at": "2099-11-03T00:00:00Z", "body": "also X"}
+        code, out = self.watch([self.view()], reviews=[theirs], comments=[later])
+        self.assertEqual(code, 1)
+        self.assertIn("also X", out)
+        self.assertNotIn("a few nits", out)
+
+    def test_conflict_and_red_checks(self):
+        conn = gj.db()
+        eid = conn.execute("INSERT INTO efforts(title, created_at, updated_at) VALUES ('c', 0, 0)").lastrowid
+        gj.add_pr(conn, eid, "https://github.com/a/b/pull/6")
+        conn.commit()
+        self.URL = "https://github.com/a/b/pull/6"
+        code, out = self.watch([self.view(mergeable="CONFLICTING")])
+        self.assertEqual(code, 1)
+        self.assertIn("conflicts with its base branch", out)
+        red = [{"name": "build", "bucket": "fail", "link": ""}]
+        code, out = self.watch([self.view()], checks=red)
+        self.assertEqual(code, 1)
+        self.assertIn("CI failing", out)
+        # the same red commit doesn't wake it again: it waits on, here until the merge
+        code, out = self.watch([self.view(), self.view(state="MERGED")], checks=red)
+        self.assertEqual(code, 0)
+        code, out = self.watch([self.view(state="CLOSED")])
+        self.assertEqual(code, 3)

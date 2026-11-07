@@ -98,6 +98,7 @@ gj sync [--all]                   gj serve [--port 7777] [--open]
 gj service install|uninstall|status [--port 7777] [--open]
 gj codex-wait [PR] [--request] [--timeout 40]   # wait for Codex's next review and print it
 gj ci-wait [PR] [--timeout 60]                 # wait for required checks; print failures and logs
+gj merge-wait [PR] [--timeout 4320]            # watch a PR until it merges; wake on feedback, conflicts, red CI
 gj summary daily|weekly [--digest]   # --digest prints Claude's input without calling it
 gj history [--id N]                  # stages, Codex/CI rounds, tokens, and pushback for an effort
 gj scan [--force]                    # read transcripts now (--force: even sessions still running)
@@ -107,7 +108,11 @@ Commands with no `--id` act on the effort registered by the calling agent sessio
 
 Stages are plan › build › verify › review › ci › codex › final › human › merge. A PR opens as
 a draft so CI goes green (`ci`) before Codex reviews it, and CI goes green again after the review
-(`final`); `gj install` writes the full rules.
+(`final`). In `human` the agent runs `gj merge-wait` in the background. It polls GitHub
+without using tokens for up to 3 days and wakes the agent only for the merge, for feedback from
+someone other than the PR's author, for a merge conflict, or for a failing required check.
+Approval alone keeps it waiting, and the board doesn't count the watch as the agent working.
+`gj install` writes the full rules.
 
 Statuses are `active`, `review`, `blocked`, `done`, and `dropped`. Epics are free text, and
 the dashboard groups efforts by epic.

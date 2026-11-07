@@ -847,6 +847,7 @@ def liveness(e):
 _shells = {}   # log path -> [bytes read, {task id: (launched, description)}, {tool_use id: description}]
 SHELL_LAUNCH = re.compile(r'"backgroundTaskId":"(\w+)"')
 SHELL_DONE = re.compile(r"<task-id>(\w+)</task-id>")
+MERGE_WATCH = re.compile(r"\s*(\S*/)?gj merge-wait\b[^;&|\n]*")   # alone, not chained to other work
 
 
 def background_shells(log):
@@ -875,12 +876,15 @@ def background_shells(log):
                     continue
                 if b.get("type") == "tool_use" and (b.get("input") or {}).get("run_in_background"):
                     inp = b["input"]
-                    st[2][b.get("id")] = inp.get("description") or clip(inp.get("command") or "", 80)
+                    # a merge watch can sit for days waiting on a human: that's not the agent working
+                    st[2][b.get("id")] = None if MERGE_WATCH.fullmatch(inp.get("command") or "") else (
+                        inp.get("description") or clip(inp.get("command") or "", 80))
                 elif b.get("type") == "tool_result":
                     tid = (d.get("toolUseResult") or {}).get("backgroundTaskId") if isinstance(
                         d.get("toolUseResult"), dict) else None
-                    if tid:
-                        st[1][tid] = (parse_ts(d.get("timestamp")) or now(), st[2].get(b.get("tool_use_id"), ""))
+                    desc = st[2].get(b.get("tool_use_id"), "")
+                    if tid and desc is not None:
+                        st[1][tid] = (parse_ts(d.get("timestamp")) or now(), desc)
         for tid in SHELL_DONE.findall(raw):
             st[1].pop(tid, None)
     # a session that died never reports its shells; give up on them after 6 hours
@@ -1210,6 +1214,120 @@ def cmd_ci_wait(args):
             record(url, "ci", "timeout")
             print("gj: required checks on %s still running after %d min. Tell the user; don't keep waiting."
                   % (url, args.timeout))
+            sys.exit(2)
+        time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------- merge watch
+
+def human_feedback(repo, num, author, since):
+    """[(at, who, state, body, inline comments)] newer than `since`: requested changes, reviews from people
+    other than the PR's author (agents reply on threads as the author), approvals that say something, and
+    conversation comments other than `@codex` requests. None if gh failed."""
+    reviews = gh_items("repos/%s/pulls/%s/reviews" % (repo, num))
+    comments = gh_items("repos/%s/issues/%s/comments" % (repo, num))
+    if reviews is None or comments is None:
+        return None
+    out = []
+    for r in reviews:
+        u, at = r.get("user") or {}, parse_ts(r.get("submitted_at"))
+        if u.get("type") == "Bot" or at <= since:
+            continue
+        if r.get("state") == "CHANGES_REQUESTED" or (
+                r.get("state") in ("COMMENTED", "APPROVED") and u.get("login") != author):
+            inline = gh_items("repos/%s/pulls/%s/reviews/%s/comments" % (repo, num, r["id"])) or []
+            if r["state"] != "APPROVED" or inline or (r.get("body") or "").strip():
+                out.append((at, u.get("login"), r["state"], r.get("body") or "", inline))
+    for c in comments:
+        u, at = c.get("user") or {}, parse_ts(c.get("created_at"))
+        if u.get("type") != "Bot" and at > since and not re.match(r"\s*@codex\b", c.get("body") or ""):
+            out.append((at, u.get("login"), "COMMENTED", c.get("body") or "", []))
+    return sorted(out, key=lambda x: x[0])
+
+
+def feedback_since(url):
+    """Feedback older than this was already handed to an agent. For a PR gj doesn't track, nothing can
+    be remembered between runs, so only what arrives from now on counts."""
+    try:
+        conn = db()
+        if not conn.execute("SELECT 1 FROM prs WHERE url = ?", (url,)).fetchone():
+            return now()
+        row = conn.execute("SELECT data FROM events WHERE kind = 'feedback' AND note = ? ORDER BY id DESC "
+                           "LIMIT 1", (url,)).fetchone()
+        conn.close()
+        return json.loads(row["data"])["until"] if row else 0
+    except Exception:
+        return now()
+
+
+def reported(url, value, sha):
+    """Was this state of this commit already handed to an agent?"""
+    try:
+        conn = db()
+        rows = conn.execute("SELECT data FROM events WHERE kind = 'merge' AND value = ? AND note = ?",
+                            (value, url)).fetchall()
+        conn.close()
+        return any(json.loads(r["data"] or "{}").get("sha") == sha for r in rows)
+    except Exception:
+        return False
+
+
+def cmd_merge_wait(args):
+    url, repo, num = effort_pr(args)
+    url = "https://github.com/%s/pull/%s" % (repo, num)
+    since, start, approved = feedback_since(url), now(), False
+    print("gj: watching %s until it merges (up to %d h)" % (url, args.timeout // 60), flush=True)
+    while True:
+        polled = now()
+        out = run(["gh", "pr", "view", url, "--json",
+                   "state,reviewDecision,mergeable,headRefOid,author,mergedBy,latestReviews"], timeout=60)
+        v = json.loads(out) if out else None
+        fb = v and v["state"] == "OPEN" and human_feedback(repo, num, (v.get("author") or {}).get("login"), since)
+        if v and v["state"] == "MERGED":
+            by = (v.get("mergedBy") or {}).get("login") or "?"
+            record(url, "merge", "merged", {"sha": v["headRefOid"], "by": by})
+            print("%s merged (by %s). Tell the user; gj closes the effort." % (url, by))
+            return
+        if v and v["state"] == "CLOSED":
+            print("gj: %s was closed without merging. Tell the user and stop." % url)
+            sys.exit(3)
+        if fb:
+            # until = when this poll began: something that landed mid-poll is shown again, never lost
+            record(url, "feedback", "", {"until": max(polled, fb[-1][0]), "from": sorted({f[1] for f in fb})})
+            for at, who, state, body, inline in fb:
+                print("\n%s %s:" % (who, {"CHANGES_REQUESTED": "requested changes",
+                                           "APPROVED": "approved, with comments"}.get(state, "commented")))
+                if body.strip():
+                    print("  " + clip(body, 1500))
+                for c in inline:
+                    print(codex_finding(c))
+            print("\nAddress what is real (`gj stage build`, fix, verify) and reply on each thread with what you"
+                  " changed or why not. Push, run the CI loop (`gj stage final`), then `gj stage human` and"
+                  " `gj merge-wait` again. If nothing needs a change, just run `gj merge-wait` again.")
+            sys.exit(1)
+        if v and v["mergeable"] == "CONFLICTING" and not reported(url, "conflict", v["headRefOid"]):
+            record(url, "merge", "conflict", {"sha": v["headRefOid"]})
+            print("%s conflicts with its base branch. Merge or rebase onto it, resolve, re-run the checks the"
+                  " conflict touched, push, run the CI loop (`gj stage final`), then `gj stage human` and"
+                  " `gj merge-wait` again." % url)
+            sys.exit(1)
+        checks = required_checks(url) if v else None
+        if checks:
+            done, green, text = ci_report(checks)
+            if done and not green and not reported(url, "red", v["headRefOid"]):
+                record(url, "merge", "red", {"sha": v["headRefOid"]})
+                print(text + "\nRun the CI loop (`gj stage final`; `gj ci-wait` prints the logs), then"
+                      " `gj stage human` and `gj merge-wait` again. If it can't go green, tell the user;"
+                      " running `gj merge-wait` again won't wake you for the same failure.")
+                sys.exit(1)
+        if v and v["reviewDecision"] == "APPROVED" and not approved:
+            approved = True
+            by = sorted(r["author"]["login"] for r in v.get("latestReviews") or []
+                        if r.get("state") == "APPROVED" and r.get("author"))
+            record(url, "merge", "approved", {"sha": v["headRefOid"], "by": ", ".join(by)})
+            print("gj: approved by %s; waiting for the merge." % (", ".join(by) or "?"), flush=True)
+        if now() > start + args.timeout * 60:
+            print("gj: %s still not merged after %d h. Tell the user and stop." % (url, args.timeout // 60))
             sys.exit(2)
         time.sleep(args.interval)
 
@@ -2141,7 +2259,8 @@ For building work, do this without being asked:
    | `ci` | Drive the required checks to green: the CI loop below. | It is green: `gh pr ready` (this starts Codex's review), then `gj stage codex`. |
    | `codex` | The Codex review loop below. | `gj stage final` |
    | `final` | The CI loop again, on the commits the review added. If nothing was pushed since CI went green, there is nothing to do. | It is green: `gj stage human`, and summarize what is still open for the human reviewer. |
-   | `human`, `merge` | Nothing. gj follows approval and merge on GitHub. | |
+   | `human` | Watch the PR until it merges: the merge watch below. | It merges: tell the user. gj closes the effort. |
+   | `merge` | Nothing. gj sets it when the PR merges. | |
 
    A long effort goes around more than once. When one PR is out and the next piece starts, report
    `gj stage plan` (or `build`) again. The effort stays open while you report work after its last PR.
@@ -2167,7 +2286,21 @@ For building work, do this without being asked:
      `@codex review` and waits for the next round.
    - Stop after 3 rounds with findings, or sooner when nothing Codex raises is a real problem. Then run
      `gj stage final`. If `gj codex-wait` times out, tell the user and stop.
-5. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
+5. **Merge watch.** Once the PR is with the human reviewer, watch it until it merges. In Claude Code,
+   run `gj merge-wait` as a background command and end your turn. It watches GitHub without using tokens
+   for up to 3 days and wakes you only when there is something to do; approval alone doesn't. Elsewhere,
+   skip it: gj follows the merge on its own.
+   - Merged: tell the user in one line. gj closes the effort.
+   - Feedback from a reviewer, or changes requested: it prints each comment. Address what is real
+     (`gj stage build`, fix, verify) and reply on each thread with what you changed or why not. Push, run
+     the CI loop (`gj stage final`), then `gj stage human` and `gj merge-wait` again. Don't start another
+     Codex round.
+   - A merge conflict: merge or rebase onto the base branch, resolve, re-run the checks it touched, push,
+     and continue from the CI loop as above.
+   - A required check failing: the CI loop (`gj stage final`), then `gj stage human` and `gj merge-wait`
+     again. The same failure on the same commit doesn't wake you twice.
+   - Closed without merging, or timed out: tell the user and stop.
+6. If you get stuck waiting on the user: `gj status blocked --note "<what you need>"`.
    When the work is finished without a PR: `gj status done`.
 
 `gj` detects the agent and session on its own. If a `gj` command fails, mention it once and keep working.
@@ -2334,6 +2467,13 @@ def main(argv=None):
     p.add_argument("--interval", type=int, default=45, help=argparse.SUPPRESS)
     p.add_argument("--id", type=int)
     p.set_defaults(fn=cmd_ci_wait)
+
+    p = sub.add_parser("merge-wait", help="watch an approved-for-review PR until it merges")
+    p.add_argument("pr", nargs="?", help="PR url (default: this effort's open PR)")
+    p.add_argument("--timeout", type=int, default=3 * 24 * 60, help="minutes (default 3 days)")
+    p.add_argument("--interval", type=int, default=120, help=argparse.SUPPRESS)
+    p.add_argument("--id", type=int)
+    p.set_defaults(fn=cmd_merge_wait)
 
     p = sub.add_parser("summary", help="Claude's daily (once a day) or weekly summary")
     p.add_argument("kind", choices=sorted(SUMMARY_PROMPTS))
